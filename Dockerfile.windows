@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+#
+# Cross-compile twister-splitter into a self-contained Windows x86_64 .exe.
+#
+# Build (BuildKit required; on by default in modern Docker):
+#
+#   docker build -f Dockerfile.windows --target export \
+#     --output type=local,dest=./dist .
+#
+# The artifact lands at ./dist/twister-splitter.exe — copy it straight onto a
+# Windows 10 machine and run it; no extra DLLs are needed.
+
+# rust:1-bookworm tracks the latest stable 1.x, which is >= 1.85 as required by
+# this crate's edition 2024.
+FROM rust:1-bookworm AS builder
+
+# MinGW-w64 supplies the Windows GNU linker (x86_64-w64-mingw32-gcc).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends mingw-w64 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-pc-windows-gnu
+
+WORKDIR /app
+COPY . .
+
+# Cache the registry and target dir between builds. Because cache mounts are not
+# part of the image, copy the finished exe to a normal path for the export stage.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --target x86_64-pc-windows-gnu \
+ && cp target/x86_64-pc-windows-gnu/release/twister-splitter.exe /twister-splitter.exe
+
+# Verify the exe is self-contained: print its DLL imports and fail the build if
+# any MinGW runtime DLL leaked in (those would be missing on a stock Windows box).
+RUN echo "== twister-splitter.exe DLL imports ==" \
+ && x86_64-w64-mingw32-objdump -p /twister-splitter.exe | grep "DLL Name" \
+ && ! x86_64-w64-mingw32-objdump -p /twister-splitter.exe \
+      | grep -qiE "libgcc|libstdc\+\+|libwinpthread"
+
+# Artifact-only stage: `--target export --output ...` writes just the exe.
+FROM scratch AS export
+COPY --from=builder /twister-splitter.exe /

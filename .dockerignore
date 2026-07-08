@@ -1,0 +1,7 @@
+# Keep the build context small — none of this is needed to compile the binary.
+/target
+/dist
+/out
+/fixtures
+.git
+.DS_Store
