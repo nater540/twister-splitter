@@ -253,6 +253,15 @@ struct Params {
   sources: Sources,
   export_format: ExportFormat,
   combine_single: bool, // display/future
+  // --- Cut-output (emit-time) options, consumed by `emit::emit_opts` on Export.
+  /// Engrave each part's 1-based assembly number as TEXT on the `Engrave` layer (R3-2).
+  engrave_numbers: bool,
+  /// Micro-tab (holding-bridge) width in mm; `tab_width > 0 && tab_count > 0` ⇒ on (R3-3).
+  tab_width: f64,
+  /// Number of micro-tabs distributed around each outline.
+  tab_count: usize,
+  /// Split loose-part outer contour vs holes onto `Cut-Outer`/`Cut-Inner` (R1-1b).
+  split_cut_layers: bool,
 }
 
 impl Default for Params {
@@ -273,6 +282,10 @@ impl Default for Params {
       sources: Sources::Both,
       export_format: ExportFormat::Dxf,
       combine_single: false,
+      engrave_numbers: false,
+      tab_width: 0.0,
+      tab_count: 0,
+      split_cut_layers: false,
     }
   }
 }
@@ -340,9 +353,16 @@ enum Intent {
   SetView(View),
   ShowSheet(usize),
   SelectPiece(Option<usize>),
-  Export,
+  /// Export DXF/SVG. `all` = every sheet; otherwise only the active sheet (R0-2).
+  Export { all: bool },
   ShowNewJob(bool),
   Status(String),
+  /// Multiply the canvas zoom by a factor, clamped (R0-1).
+  ZoomBy(f32),
+  /// Reset zoom to the base fit (active sheet fills the canvas) (R0-1).
+  FitSheet,
+  /// Set zoom to 1 px per mm (R0-1).
+  ActualSize,
   /// Rotate the selected placement by `quarter_turns` × 90° (S-5).
   RotateSelected(i32),
   /// Mirror the selected placement about its footprint centre (S-4).
@@ -350,6 +370,8 @@ enum Intent {
   FlipVSelected,
   MoveSelectedToSheet(usize),
   ToggleLockSelected,
+  /// Change the selected piece's copy count by `delta`, clamped to ≥ 1 (R3-1).
+  BumpSelectedQuantity(i32),
   RecomputeStats,
 }
 
@@ -369,9 +391,14 @@ pub struct App {
   export_diagnostics: Vec<crate::diag::Diagnostic>,
   status: String,
   show_new_job: bool,
+  show_about: bool,
+  show_shortcuts: bool,
   // Canvas view state.
   zoom: f32,
   pan: Vec2,
+  /// Base fit scale (px per mm at zoom = 1) recorded by the last `canvas` render,
+  /// so "Actual Size" (1 px/mm) can solve for the zoom that cancels it.
+  last_base_scale: f64,
   show_grid: bool,
   show_labels: bool,
   show_margins: bool,
@@ -393,8 +420,11 @@ impl App {
       export_diagnostics: Vec::new(),
       status: "Open a DXF to begin — File ▸ Open DXF…".into(),
       show_new_job: false,
+      show_about: false,
+      show_shortcuts: false,
       zoom: 1.0,
       pan: Vec2::ZERO,
+      last_base_scale: 1.0,
       show_grid: true,
       show_labels: true,
       show_margins: true,
@@ -438,6 +468,7 @@ impl eframe::App for App {
   fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
     let ctx = ui.ctx().clone();
     self.poll_job(&ctx);
+    self.handle_shortcuts(&ctx);
     layout(self, ui);
     let intents = std::mem::take(&mut self.intents);
     for intent in intents {
@@ -447,6 +478,35 @@ impl eframe::App for App {
 }
 
 impl App {
+  /// Global keyboard shortcuts for zoom/nav and export (R0-1, R0-2). Consumed
+  /// before layout so they don't leak into focused widgets; each queues an intent
+  /// drained after layout, exactly like the equivalent menu items.
+  fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+    use egui::{Key, KeyboardShortcut, Modifiers};
+    let cmd = Modifiers::COMMAND; // ⌘ on macOS, Ctrl elsewhere
+    let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+    let hit = |mods, key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(mods, key)));
+    // Zoom In accepts both ⌘= (unshifted +) and the keypad/shifted ⌘+.
+    if hit(cmd, Key::Plus) || hit(cmd, Key::Equals) {
+      self.intents.push(Intent::ZoomBy(1.1));
+    }
+    if hit(cmd, Key::Minus) {
+      self.intents.push(Intent::ZoomBy(0.9));
+    }
+    if hit(cmd, Key::Num0) {
+      self.intents.push(Intent::FitSheet);
+    }
+    if hit(cmd, Key::Num1) {
+      self.intents.push(Intent::ActualSize);
+    }
+    // Check the shifted export first so it doesn't fall through to active-sheet.
+    if hit(cmd_shift, Key::E) {
+      self.intents.push(Intent::Export { all: true });
+    } else if hit(cmd, Key::E) {
+      self.intents.push(Intent::Export { all: false });
+    }
+  }
+
   fn poll_job(&mut self, ctx: &egui::Context) {
     if let Job::Running { rx, .. } = &self.job {
       match rx.try_recv() {
@@ -504,9 +564,19 @@ impl App {
         // Map the picked index to its stable id so selection survives re-nesting.
         self.sel_id = p.and_then(|i| self.model.as_ref().and_then(|m| m.pieces.get(i)).map(|pc| pc.id));
       }
-      Intent::Export => self.export(),
+      Intent::Export { all } => self.export(all),
       Intent::ShowNewJob(v) => self.show_new_job = v,
       Intent::Status(s) => self.status = s,
+      Intent::ZoomBy(f) => self.zoom = (self.zoom * f).clamp(0.2, 8.0),
+      Intent::FitSheet => {
+        self.zoom = 1.0;
+        self.pan = Vec2::ZERO;
+      }
+      Intent::ActualSize => {
+        // Solve for the zoom that makes the total scale 1 px/mm: total = base·zoom.
+        self.zoom = ((1.0 / self.last_base_scale.max(1e-6)) as f32).clamp(0.2, 8.0);
+        self.pan = Vec2::ZERO;
+      }
       Intent::RotateSelected(qt) => {
         if self.edit_selected(|pl, bbox| pl.rotate(bbox, qt)) {
           self.status = "Rotated selected part.".into();
@@ -534,6 +604,22 @@ impl App {
           locked = pl.locked;
         }) {
           self.status = if locked { "Locked selected part." } else { "Unlocked selected part." }.into();
+        }
+      }
+      Intent::BumpSelectedQuantity(delta) => {
+        // Copy count is a nest-packer feature: it changes how many items
+        // `nest::build_items` reserves, so it only takes effect on the next
+        // Split & Nest (the rect packer ignores it).
+        let mut msg = None;
+        if let Some(id) = self.sel_id
+          && let Some(model) = &mut self.model
+          && let Some(pc) = model.pieces.iter_mut().find(|p| p.id == id)
+        {
+          pc.quantity = (pc.quantity as i32 + delta).max(1) as usize;
+          msg = Some(format!("{} — quantity {}. Re-nest to apply.", pc.label, pc.quantity));
+        }
+        if let Some(m) = msg {
+          self.status = m;
         }
       }
       Intent::RecomputeStats => self.recompute_stats(),
@@ -600,7 +686,18 @@ impl App {
 
   fn reextract(&mut self) {
     let Some(model) = &mut self.model else { return };
-    let (pieces, mut diagnostics) = extract::extract(&model.drawing, self.params.sources);
+    // Re-extraction rebuilds every `Piece` with `quantity = 1`; remember any
+    // user-set copy counts by stable `Piece.id` so they survive the rebuild (R3-1).
+    let saved_qty: std::collections::HashMap<u64, usize> =
+      model.pieces.iter().filter(|p| p.quantity != 1).map(|p| (p.id, p.quantity)).collect();
+    let (mut pieces, mut diagnostics) = extract::extract(&model.drawing, self.params.sources);
+    if !saved_qty.is_empty() {
+      for p in pieces.iter_mut() {
+        if let Some(&q) = saved_qty.get(&p.id) {
+          p.quantity = q;
+        }
+      }
+    }
     // Add hull-fallback notes (non-simple outline nested by convex hull).
     for it in nest::build_items(&model.drawing, &pieces) {
       if it.hull_fallback {
@@ -705,7 +802,11 @@ impl App {
     ctx.request_repaint();
   }
 
-  fn export(&mut self) {
+  /// Export to a chosen folder. `all` writes every sheet; otherwise only the
+  /// active sheet (R0-2). Both packers name files `{stem}_sheet_{NN}.dxf/.svg`
+  /// by sheet order, so the single-sheet case renumbers its placements to sheet 0
+  /// to produce exactly one file rather than empty leading sheets.
+  fn export(&mut self, all: bool) {
     let (Some(model), Some(outcome)) = (&self.model, &self.outcome) else {
       self.status = "Nothing to export yet — run Split & Nest first.".into();
       return;
@@ -713,23 +814,47 @@ impl App {
     let Some(dir) = rfd::FileDialog::new().pick_folder() else { return };
     let stem = model.path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let (w, h) = (self.params.stock_w, self.params.stock_h);
-    let kerf = self.params.kerf_mm;
+    // All emit-time cut options ride on one `EmitOptions`. Each active mode pushes
+    // a diagnostic (kerf-comp / engrave / micro-tabs / split-layers), surfaced below.
+    let opts = emit::EmitOptions {
+      kerf_comp: self.params.kerf_mm,
+      engrave_numbers: self.params.engrave_numbers,
+      tab_width: self.params.tab_width,
+      tab_count: self.params.tab_count,
+      split_cut_layers: self.params.split_cut_layers,
+    };
+    // Active-sheet export keeps only this sheet's placements, renumbered to 0.
+    let filtered: Vec<Placed>;
+    let placed: &[Placed] = if all {
+      &outcome.placed
+    } else {
+      filtered = outcome
+        .placed
+        .iter()
+        .filter(|p| p.sheet == self.active_sheet)
+        .map(|p| {
+          let mut c = p.clone();
+          c.move_to_sheet(0);
+          c
+        })
+        .collect();
+      &filtered
+    };
     let result: std::io::Result<(usize, Vec<crate::diag::Diagnostic>)> = match self.params.export_format {
       ExportFormat::Dxf => {
-        // `emit`'s trailing `kerf_comp`: > 0 applies compensation (curved cuts
-        // approximated as polylines, flagged via diagnostics); 0 keeps splines.
-        emit::emit(&model.drawing, &model.pieces, &outcome.placed, &dir, stem, kerf).map(|r| (r.files.len(), r.diagnostics))
+        emit::emit_opts(&model.drawing, &model.pieces, placed, &dir, stem, opts).map(|r| (r.files.len(), r.diagnostics))
       }
       ExportFormat::Svg => {
         // SVG keeps faithful outlines — the kerf-comp polyline path is DXF-only.
-        svg::write_svg(&model.drawing, &model.pieces, &outcome.placed, &dir, stem, w, h, self.params.combine_single)
+        svg::write_svg(&model.drawing, &model.pieces, placed, &dir, stem, w, h, self.params.combine_single)
           .map(|files| (files.len(), Vec::new()))
       }
     };
     match result {
       Ok((n, diags)) => {
+        let scope = if all { "all sheets".to_string() } else { format!("sheet {}", self.active_sheet + 1) };
         let note = diags.first().map(|d| format!(" · {}", d.message)).unwrap_or_default();
-        self.status = format!("Wrote {n} file(s) to {}{note}.", dir.display());
+        self.status = format!("Wrote {n} file(s) ({scope}) to {}{note}.", dir.display());
         self.export_diagnostics = diags;
       }
       Err(e) => self.status = format!("Export failed: {e}"),
@@ -930,6 +1055,12 @@ fn layout(app: &mut App, ui: &mut egui::Ui) {
   if app.show_new_job {
     new_job_dialog(app, ui.ctx());
   }
+  if app.show_about {
+    about_dialog(app, ui.ctx());
+  }
+  if app.show_shortcuts {
+    shortcuts_dialog(app, ui.ctx());
+  }
 }
 
 // ---- Title bar ------------------------------------------------------------
@@ -1004,9 +1135,11 @@ fn menu_bar(app: &mut App, ui: &mut egui::Ui) {
       }
       ui.separator();
       if menu_item(ui, "Export Active Sheet…", "⌘E") {
-        app.intents.push(Intent::Export);
+        app.intents.push(Intent::Export { all: false });
       }
-      menu_todo(app, ui, "Export All Sheets…", "⇧⌘E");
+      if menu_item(ui, "Export All Sheets…", "⇧⌘E") {
+        app.intents.push(Intent::Export { all: true });
+      }
       ui.separator();
       menu_todo(app, ui, "Save Layout", "⌘S");
       if menu_item(ui, "Quit", "⌘Q") {
@@ -1025,10 +1158,18 @@ fn menu_bar(app: &mut App, ui: &mut egui::Ui) {
       menu_todo(app, ui, "Delete From Nest", "⌫");
     });
     ui.menu_button("View", |ui| {
-      menu_todo(app, ui, "Zoom In", "⌘+");
-      menu_todo(app, ui, "Zoom Out", "⌘−");
-      menu_todo(app, ui, "Fit Sheet", "⌘0");
-      menu_todo(app, ui, "Actual Size", "⌘1");
+      if menu_item(ui, "Zoom In", "⌘+") {
+        app.intents.push(Intent::ZoomBy(1.1));
+      }
+      if menu_item(ui, "Zoom Out", "⌘−") {
+        app.intents.push(Intent::ZoomBy(0.9));
+      }
+      if menu_item(ui, "Fit Sheet", "⌘0") {
+        app.intents.push(Intent::FitSheet);
+      }
+      if menu_item(ui, "Actual Size", "⌘1") {
+        app.intents.push(Intent::ActualSize);
+      }
       ui.separator();
       menu_toggle(ui, &mut app.show_grid, "Show Grid");
       menu_toggle(ui, &mut app.show_labels, "Show Part Labels");
@@ -1039,7 +1180,9 @@ fn menu_bar(app: &mut App, ui: &mut egui::Ui) {
         app.intents.push(Intent::StartNest(NestMode::Global));
       }
       ui.add_enabled_ui(app.outcome.is_some(), |ui| {
-        if menu_item(ui, "Re-nest Current Sheet", "⌘R") {
+        // ⇧⌘R, not ⌘R: the plain chord is Reload Source (File menu). Reload is the
+        // conventional ⌘R and keeps the source; re-nesting is the shifted variant.
+        if menu_item(ui, "Re-nest Current Sheet", "⇧⌘R") {
           app.intents.push(Intent::StartNest(NestMode::CurrentSheet));
         }
       });
@@ -1100,9 +1243,11 @@ fn menu_bar(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.menu_button("Export", |ui| {
       if menu_item(ui, "Export Active Sheet…", "⌘E") {
-        app.intents.push(Intent::Export);
+        app.intents.push(Intent::Export { all: false });
       }
-      menu_todo(app, ui, "Export All Sheets…", "⇧⌘E");
+      if menu_item(ui, "Export All Sheets…", "⇧⌘E") {
+        app.intents.push(Intent::Export { all: true });
+      }
       ui.separator();
       let mut fmt = app.params.export_format;
       if ui.radio_value(&mut fmt, ExportFormat::Dxf, "Format: DXF").clicked() {
@@ -1116,8 +1261,12 @@ fn menu_bar(app: &mut App, ui: &mut egui::Ui) {
       menu_toggle(ui, &mut app.params.combine_single, "Combine Into Single File");
     });
     ui.menu_button("Help", |ui| {
-      menu_todo(app, ui, "Keyboard Shortcuts", "");
-      menu_todo(app, ui, "About Twister Splitter", "");
+      if menu_item(ui, "Keyboard Shortcuts", "") {
+        app.show_shortcuts = true;
+      }
+      if menu_item(ui, "About Twister Splitter", "") {
+        app.show_about = true;
+      }
     });
   });
 }
@@ -1137,8 +1286,9 @@ fn control_bar(app: &mut App, ui: &mut egui::Ui) {
     toggle_pill(ui, &mut app.params.allow_rotation);
 
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+      // The bar's Export is the general action — every sheet (R0-2).
       if outline_button(ui, "Export", 28.0).clicked() {
-        app.intents.push(Intent::Export);
+        app.intents.push(Intent::Export { all: true });
       }
       ui.add_space(8.0);
       let can_nest = app.model.is_some() && !app.is_running();
@@ -1284,6 +1434,29 @@ fn setup_panel(app: &mut App, ui: &mut egui::Ui) {
         app.intents.push(Intent::Status("Output directory is chosen at export time.".into()));
       }
     });
+
+    divider(ui);
+    section_header(ui, "Cut Output");
+    labeled_toggle(ui, "Engrave part numbers", &mut app.params.engrave_numbers);
+    labeled_toggle(ui, "Split outer/inner layers", &mut app.params.split_cut_layers);
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+      ui.add_space(14.0);
+      field_label(ui, "Micro-tabs");
+    });
+    ui.horizontal(|ui| {
+      ui.add_space(14.0);
+      labeled_number(ui, "Width", &mut app.params.tab_width, "mm", 100.0);
+      labeled_count(ui, "Count", &mut app.params.tab_count, 100.0);
+    });
+    ui.horizontal(|ui| {
+      ui.add_space(14.0);
+      ui.label(
+        egui::RichText::new("Tabs & kerf comp. approximate curves.")
+          .font(theme::mono(9.5))
+          .color(theme::TEXT_MUTED),
+      );
+    });
     ui.add_space(10.0);
   });
 
@@ -1365,7 +1538,7 @@ fn stats_panel(app: &mut App, ui: &mut egui::Ui) {
       .corner_radius(CornerRadius::same(6)),
   );
   if resp.clicked() {
-    app.intents.push(Intent::Export);
+    app.intents.push(Intent::Export { all: false });
   }
 }
 
@@ -1509,6 +1682,8 @@ fn canvas(app: &mut App, ui: &mut egui::Ui) {
     return;
   }
   let map = Mapper::fit(fit_box, rect, 30.0, app.zoom, app.pan);
+  // Record the base fit scale (px/mm at zoom = 1) so "Actual Size" can cancel it.
+  app.last_base_scale = map.scale / app.zoom.max(1e-4) as f64;
 
   // In Sheets view, clip parts to the stock board so nothing bleeds over the
   // sheet edge onto the empty canvas (placed parts always sit within the board).
@@ -1560,21 +1735,36 @@ fn canvas(app: &mut App, ui: &mut egui::Ui) {
     let pick = pick_part(app, model, &map, pos);
     app.intents.push(Intent::SelectPiece(pick));
   }
-  let sel_label = app.sel_id.and_then(|id| model.pieces.iter().find(|p| p.id == id).map(|p| p.label.clone()));
+  let sel_piece = app.sel_id.and_then(|id| model.pieces.iter().find(|p| p.id == id));
+  let sel_label = sel_piece.map(|p| p.label.clone());
+  let sel_qty = sel_piece.map(|p| p.quantity);
   let sheet_count = app.outcome.as_ref().map_or(0, |o| o.sheets);
-  response.context_menu(|ui| part_context_menu(&mut app.intents, ui, sel_label.as_deref(), sheet_count));
+  response.context_menu(|ui| part_context_menu(&mut app.intents, ui, sel_label.as_deref(), sheet_count, sel_qty));
 
   zoom_hud(app, ui, rect);
 }
 
-/// Right-click context menu for a placed part (S-5 actions).
-fn part_context_menu(intents: &mut Vec<Intent>, ui: &mut egui::Ui, sel_label: Option<&str>, sheets: usize) {
+/// Right-click context menu for a placed part (S-5 actions + R3-1 copy count).
+fn part_context_menu(intents: &mut Vec<Intent>, ui: &mut egui::Ui, sel_label: Option<&str>, sheets: usize, qty: Option<usize>) {
   match sel_label {
     None => {
       ui.label(egui::RichText::new("Right-click a part to act on it").font(theme::sans(12.0)).color(theme::TEXT_MUTED));
     }
     Some(label) => {
       ui.label(egui::RichText::new(label.to_uppercase()).font(theme::sans(10.0)).color(theme::white_a(90)));
+      ui.separator();
+      // Copy count (R3-1): a nest-packer stepper. Buttons don't close the menu so
+      // the count can be nudged repeatedly; the change applies on the next re-nest.
+      ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Copies").font(theme::sans(12.0)).color(theme::TEXT_SECONDARY));
+        if ui.button("−").clicked() {
+          intents.push(Intent::BumpSelectedQuantity(-1));
+        }
+        ui.label(egui::RichText::new(qty.unwrap_or(1).to_string()).font(theme::mono(12.0)).color(theme::TEXT_PRIMARY));
+        if ui.button("+").clicked() {
+          intents.push(Intent::BumpSelectedQuantity(1));
+        }
+      });
       ui.separator();
       if ui.button("Rotate 90° CW").clicked() {
         intents.push(Intent::RotateSelected(-1));
@@ -1895,6 +2085,108 @@ fn new_job_dialog(app: &mut App, ctx: &egui::Context) {
   }
 }
 
+/// A modal in the Slate style: centred, fixed-width, panel-filled. `body` returns
+/// true to request closing (e.g. its own Close button); the returned value is the
+/// new open-state (false once the window's ✕ or the body asks to close). Shared by
+/// the About and Keyboard Shortcuts dialogs (R0-4).
+fn modal(ctx: &egui::Context, id: &str, title: &str, width: f32, body: impl FnOnce(&mut egui::Ui) -> bool) -> bool {
+  let mut win_open = true;
+  let mut keep = true;
+  egui::Window::new(title)
+    .id(egui::Id::new(id))
+    .collapsible(false)
+    .resizable(false)
+    .fixed_size(Vec2::new(width, 0.0))
+    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+    .open(&mut win_open)
+    .frame(
+      egui::Frame::NONE
+        .fill(theme::PANEL)
+        .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(22)),
+    )
+    .show(ctx, |ui| {
+      if body(ui) {
+        keep = false;
+      }
+    });
+  win_open && keep
+}
+
+fn about_dialog(app: &mut App, ctx: &egui::Context) {
+  app.show_about = modal(ctx, "about_dialog", "About Twister Splitter", 460.0, |ui| {
+    ui.horizontal(|ui| {
+      // The app glyph: accent square with the white "twist" mark (as in the title bar).
+      let (r, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+      let p = ui.painter();
+      p.rect_filled(r, CornerRadius::same(6), theme::ACCENT);
+      let c = r.center();
+      let s = 5.0;
+      p.line_segment([c + Vec2::new(-s, -s), c + Vec2::new(s, s)], Stroke::new(2.2, Color32::WHITE));
+      p.line_segment([c + Vec2::new(s, -s), c + Vec2::new(-s, s)], Stroke::new(2.2, Color32::WHITE));
+      ui.add_space(10.0);
+      ui.vertical(|ui| {
+        ui.label(egui::RichText::new("Twister Splitter").font(theme::sans(16.0)).strong().color(theme::TEXT_PRIMARY));
+        ui.label(
+          egui::RichText::new(format!("version {}", env!("CARGO_PKG_VERSION")))
+            .font(theme::mono(11.0))
+            .color(theme::TEXT_MUTED),
+        );
+      });
+    });
+    ui.add_space(14.0);
+    ui.label(
+      egui::RichText::new(
+        "Splits a stacked/layered DXF into individual cuttable pieces and bin-packs \
+         them onto fixed-size sheets (shape-aware nesting) for laser cutting.",
+      )
+      .font(theme::sans(12.0))
+      .color(theme::TEXT_SECONDARY),
+    );
+    ui.add_space(16.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| primary_button(ui, "Close", 30.0).clicked())
+      .inner
+  });
+}
+
+fn shortcuts_dialog(app: &mut App, ctx: &egui::Context) {
+  app.show_shortcuts = modal(ctx, "shortcuts_dialog", "Keyboard Shortcuts", 420.0, |ui| {
+    // Only the chords actually bound to keys are listed; everything else is
+    // reachable from the menus (with the same chord shown as a reminder there).
+    let groups: [(&str, &[(&str, &str)]); 2] = [
+      (
+        "Canvas",
+        &[("Zoom In", "⌘ +"), ("Zoom Out", "⌘ −"), ("Fit Sheet", "⌘ 0"), ("Actual Size", "⌘ 1")],
+      ),
+      ("Export", &[("Export Active Sheet", "⌘ E"), ("Export All Sheets", "⇧ ⌘ E")]),
+    ];
+    for (gi, (title, rows)) in groups.iter().enumerate() {
+      if gi > 0 {
+        ui.add_space(10.0);
+      }
+      section_header_inline(ui, title);
+      ui.add_space(4.0);
+      for (label, chord) in *rows {
+        ui.horizontal(|ui| {
+          ui.label(egui::RichText::new(*label).font(theme::sans(12.0)).color(theme::TEXT_SECONDARY));
+          ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(*chord).font(theme::mono(11.0)).color(theme::TEXT_PRIMARY));
+          });
+        });
+        ui.add_space(2.0);
+      }
+    }
+    ui.add_space(14.0);
+    ui.label(
+      egui::RichText::new("Other actions are in the menus above, each showing its chord.")
+        .font(theme::mono(9.5))
+        .color(theme::TEXT_MUTED),
+    );
+    false
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Reusable Slate widgets
 // ---------------------------------------------------------------------------
@@ -1998,6 +2290,11 @@ fn outline_button(ui: &mut egui::Ui, text: &str, h: f32) -> egui::Response {
 }
 
 fn toggle_pill(ui: &mut egui::Ui, on: &mut bool) {
+  named_toggle_pill(ui, on, "rotation");
+}
+
+/// The pill toggle with an explicit accessibility name (for kittest/screen readers).
+fn named_toggle_pill(ui: &mut egui::Ui, on: &mut bool, name: &str) {
   let (rect, resp) = ui.allocate_exact_size(Vec2::new(32.0, 18.0), Sense::click());
   if resp.clicked() {
     *on = !*on;
@@ -2007,8 +2304,28 @@ fn toggle_pill(ui: &mut egui::Ui, on: &mut bool) {
   p.rect_filled(rect, CornerRadius::same(9), track);
   let knob_x = if *on { rect.right() - 9.0 } else { rect.left() + 9.0 };
   p.circle_filled(Pos2::new(knob_x, rect.center().y), 7.0, Color32::WHITE);
-  resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, *on, "rotation"));
+  let name = name.to_string();
+  resp.widget_info(move || egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, *on, name.clone()));
   ui.add_space(12.0);
+}
+
+/// A checkbox-style setup-panel row: a pill toggle followed by its label, at the
+/// panel's 14px inset.
+fn labeled_toggle(ui: &mut egui::Ui, label: &str, value: &mut bool) {
+  ui.add_space(4.0);
+  ui.horizontal(|ui| {
+    ui.add_space(14.0);
+    named_toggle_pill(ui, value, label);
+    field_label(ui, label);
+  });
+}
+
+/// Like [`labeled_number`] but for an integer count with no unit suffix.
+fn labeled_count(ui: &mut egui::Ui, label: &str, value: &mut usize, width: f32) {
+  ui.vertical(|ui| {
+    field_label(ui, label);
+    ui.add_sized(Vec2::new(width - 26.0, 28.0), egui::DragValue::new(value).range(0..=64).speed(0.1));
+  });
 }
 
 fn progress_bar(ui: &mut egui::Ui, frac: f32) {
