@@ -2,6 +2,10 @@
 name = "twister-splitter"
 version = "0.1.0"
 edition = "2024"
+# `gui` is a default feature, so both binaries build and `cargo run` is otherwise
+# ambiguous. Pin the default to the CLI/dispatcher binary (it launches the GUI
+# when run with no args — see `main`).
+default-run = "twister-splitter"
 
 [dependencies]
 anyhow = "1.0.103"
@@ -11,3 +15,26 @@ indicatif = "0.18.6"
 jagua-rs = { version = "0.7.2", features = ["bpp"] }
 rand = "0.10"
 sparrow = { git = "https://github.com/JeroenGar/sparrow", rev = "961ec31f576c5817ece779ff73982b4553760a4e", version = "0.1.0" }
+
+# GUI-only dependencies (pulled in only with `--features gui`), so the CLI build
+# stays lean. Glow (OpenGL) backend — 2D painting needs nothing heavier.
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"], optional = true }
+rfd = { version = "0.17", optional = true }
+
+[features]
+# GUI ships by default (bare `cargo run` opens the window; pass args for the CLI).
+# Build the lean, CLI-only binary with `--no-default-features` (used by the
+# Windows cross-compile to keep the exe free of eframe/MinGW C deps).
+default = ["gui"]
+# Desktop GUI. Enables the `twister-gui` binary and the `gui` library module.
+gui = ["dep:eframe", "dep:rfd"]
+
+# The desktop app as an explicit binary: `cargo run --bin twister-gui` (gui is a
+# default feature, so no `--features gui` needed). `required-features` still
+# guards it out of `--no-default-features` builds.
+[[bin]]
+name = "twister-gui"
+required-features = ["gui"]
+
+[dev-dependencies]
+egui_kittest = { version = "0.35", features = ["wgpu", "snapshot"] }

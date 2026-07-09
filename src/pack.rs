@@ -28,6 +28,7 @@ impl Placement {
       sheet: self.sheet,
       transform: Affine::place(bbox, self.theta, self.x, self.y),
       oversized: self.oversized,
+      locked: false,
     }
   }
 }

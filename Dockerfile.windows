@@ -26,9 +26,12 @@ COPY . .
 
 # Cache the registry and target dir between builds. Because cache mounts are not
 # part of the image, copy the finished exe to a normal path for the export stage.
+# `--no-default-features` drops the `gui` feature (eframe/winit/glow), so the
+# Windows exe is the lean CLI only — no MinGW C runtime deps to ship. `--bin
+# twister-splitter` avoids building the GUI-only `twister-gui` binary.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --target x86_64-pc-windows-gnu \
+    cargo build --release --no-default-features --bin twister-splitter --target x86_64-pc-windows-gnu \
  && cp target/x86_64-pc-windows-gnu/release/twister-splitter.exe /twister-splitter.exe
 
 # Verify the exe is self-contained: print its DLL imports and fail the build if

@@ -11,7 +11,6 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use twister_splitter::emit::{self, Placed};
 use twister_splitter::extract::{self, Piece, Sources};
-use twister_splitter::geom::Affine;
 use twister_splitter::nest;
 use twister_splitter::pack::{self, PackConfig};
 
@@ -33,6 +32,16 @@ struct Cli {
   /// Spacing (kerf) between neighbouring parts, in DXF units.
   #[arg(short, long, default_value_t = 2.0)]
   kerf: f64,
+
+  /// Usable inset kept clear on every sheet edge, in DXF units.
+  #[arg(long, default_value_t = 0.0)]
+  margin: f64,
+
+  /// Kerf compensation: offset each cut outline outward by half this value so
+  /// finished parts are dimensionally correct (0 = off). When on, outlines are
+  /// emitted as polylines (curved outlines approximated).
+  #[arg(long, default_value_t = 0.0)]
+  kerf_comp: f64,
 
   /// Disallow 90° rotation of pieces during nesting.
   #[arg(long)]
@@ -90,6 +99,20 @@ fn parse_size(s: &str) -> Result<(f64, f64), String> {
 }
 
 fn main() -> ExitCode {
+  // Bare launch (no CLI args) opens the desktop GUI; any args run the CLI below.
+  // With `--no-default-features` (the CLI-only Windows/headless build) this block
+  // is compiled out, so a bare invocation falls through to clap's usage output.
+  #[cfg(feature = "gui")]
+  if std::env::args_os().len() <= 1 {
+    return match twister_splitter::gui::run() {
+      Ok(()) => ExitCode::SUCCESS,
+      Err(e) => {
+        eprintln!("error: GUI failed to start: {e}");
+        ExitCode::FAILURE
+      }
+    };
+  }
+
   let cli = Cli::parse();
 
   let drawing = match Drawing::load_file(&cli.input) {
@@ -100,7 +123,17 @@ fn main() -> ExitCode {
     }
   };
 
-  let pieces = extract::extract(&drawing, cli.sources.into());
+  let (pieces, diags) = extract::extract(&drawing, cli.sources.into());
+  for d in &diags {
+    let prefix = match d.severity {
+      twister_splitter::diag::Severity::Warning => "warning",
+      twister_splitter::diag::Severity::Info => "note",
+    };
+    match &d.piece_label {
+      Some(label) => eprintln!("{prefix}: [{label}] {}", d.message),
+      None => eprintln!("{prefix}: {}", d.message),
+    }
+  }
   if pieces.is_empty() {
     eprintln!("error: no cuttable pieces found in '{}'", cli.input.display());
     return ExitCode::FAILURE;
@@ -132,8 +165,11 @@ fn main() -> ExitCode {
     .file_stem()
     .and_then(|s| s.to_str())
     .unwrap_or("out");
-  match emit::emit(&drawing, &pieces, &placed, &cli.out_dir, stem) {
+  match emit::emit(&drawing, &pieces, &placed, &cli.out_dir, stem, cli.kerf_comp) {
     Ok(report) => {
+      for d in &report.diagnostics {
+        println!("  note: {}", d.message);
+      }
       for f in &report.files {
         println!("  wrote {}", f.display());
       }
@@ -172,7 +208,7 @@ fn pack_rect(pieces: &[Piece], cli: &Cli) -> (Vec<Placed>, Vec<String>) {
 /// Shape-aware nesting (jagua-rs). Flattens each piece to a polygon, nests, then
 /// appends any piece too large for a sheet on its own sheet.
 fn pack_nest(drawing: &Drawing, pieces: &[Piece], cli: &Cli) -> (Vec<Placed>, Vec<String>) {
-  let items = nest::build_items(drawing, pieces);
+  let items = nest::build_items_with(drawing, pieces, cli.kerf_comp);
 
   // Debug: dump the piece polygons in sparrow/jagua strip-packing JSON format.
   if let Some(path) = std::env::var_os("TS_NEST_JSON") {
@@ -207,34 +243,40 @@ fn pack_nest(drawing: &Drawing, pieces: &[Piece], cli: &Cli) -> (Vec<Placed>, Ve
     bar.set_draw_target(ProgressDrawTarget::hidden());
   }
 
+  // Surface hull-fallback pieces (non-simple outline nested by convex hull).
+  for it in &items {
+    if it.hull_fallback {
+      eprintln!(
+        "note: [{}] outline was non-simple; nested by its convex hull",
+        pieces[it.piece_index].label
+      );
+    }
+  }
+
   let explore = std::time::Duration::from_secs_f64(cli.time * 0.8);
   let compress = std::time::Duration::from_secs_f64(cli.time * 0.2);
-  let result = twister_splitter::optimize::nest_sparrow(
+  let bboxes: Vec<_> = pieces.iter().map(|p| p.bbox).collect();
+  let outcome = twister_splitter::optimize::nest_sheets(
     &items,
+    &bboxes,
     cli.size.0,
     cli.size.1,
     cli.kerf,
+    cli.margin,
     0x9E37_79B9_7F4A_7C15,
     explore,
     compress,
-    |done_sheets| bar.set_message(format!("optimizing sheet {}…", done_sheets + 1)),
+    None, // CLI has no cancellation signal
+    |event| {
+      if let twister_splitter::optimize::NestEvent::SheetCompleted { sheet, .. } = event {
+        bar.set_message(format!("optimizing sheet {}…", sheet + 2));
+      }
+    },
   );
   bar.finish_and_clear();
 
-  let mut placed = result.placed;
-  // Pieces too large for any sheet each get their own sheet, recentred to the
-  // sheet origin like the rectangle packer's oversized path.
-  let mut oversized_labels = Vec::new();
-  for (k, &pi) in result.oversized.iter().enumerate() {
-    let piece = &pieces[pi];
-    placed.push(Placed {
-      piece_index: pi,
-      sheet: result.sheets + k,
-      transform: Affine::place(&piece.bbox, 0.0, 0.0, 0.0),
-      oversized: true,
-    });
-    oversized_labels.push(piece.label.clone());
-  }
+  let placed = outcome.placed;
+  let oversized_labels: Vec<String> = outcome.oversized.iter().map(|&pi| pieces[pi].label.clone()).collect();
 
   if std::env::var_os("TS_DEBUG").is_some() {
     for p in &placed {

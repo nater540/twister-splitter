@@ -115,4 +115,54 @@ impl Affine {
   pub fn rotation(&self) -> f64 {
     self.m10.atan2(self.m00)
   }
+
+  /// Determinant of the linear part. `+1` for a pure rotation, `-1` for a
+  /// reflection (mirror). Used by `emit` to correct sweep/scale for mirrored
+  /// placements.
+  pub fn determinant(&self) -> f64 {
+    self.m00 * self.m11 - self.m01 * self.m10
+  }
+
+  /// Reflection of a piece across the vertical line `x = cx` (a horizontal
+  /// flip), or the horizontal line `y = cy` (a vertical flip). These compose
+  /// onto an existing placement to mirror it in place; the result has
+  /// determinant `-1`.
+  pub fn reflect_x(cx: f64) -> Affine {
+    // (x, y) -> (2·cx - x, y)
+    Affine { m00: -1.0, m01: 0.0, m10: 0.0, m11: 1.0, tx: 2.0 * cx, ty: 0.0 }
+  }
+
+  pub fn reflect_y(cy: f64) -> Affine {
+    // (x, y) -> (x, 2·cy - y)
+    Affine { m00: 1.0, m01: 0.0, m10: 0.0, m11: -1.0, tx: 0.0, ty: 2.0 * cy }
+  }
+
+  /// Rotation by `theta` radians about the point `(cx, cy)` — a pure
+  /// rotation+translation (determinant +1), so it stays emit-faithful.
+  pub fn rotation_about(cx: f64, cy: f64, theta: f64) -> Affine {
+    let (s, c) = theta.sin_cos();
+    // p' = R*(p - c) + c  =>  translation = c - R*c
+    Affine {
+      m00: c,
+      m01: -s,
+      m10: s,
+      m11: c,
+      tx: cx - (c * cx - s * cy),
+      ty: cy - (s * cx + c * cy),
+    }
+  }
+
+  /// Compose two transforms: the result applies `inner` first, then `self`
+  /// (`self(inner(p))`). Used to layer an edit (e.g. a rotate) onto an existing
+  /// placement transform.
+  pub fn compose(&self, inner: &Affine) -> Affine {
+    Affine {
+      m00: self.m00 * inner.m00 + self.m01 * inner.m10,
+      m01: self.m00 * inner.m01 + self.m01 * inner.m11,
+      m10: self.m10 * inner.m00 + self.m11 * inner.m10,
+      m11: self.m10 * inner.m01 + self.m11 * inner.m11,
+      tx: self.m00 * inner.tx + self.m01 * inner.ty + self.tx,
+      ty: self.m10 * inner.tx + self.m11 * inner.ty + self.ty,
+    }
+  }
 }

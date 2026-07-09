@@ -39,7 +39,7 @@ fn self_intersects(ring: &[[f64; 2]]) -> bool {
 fn fixture_pieces_flatten_to_simple_polygons() {
   let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/gengar-stacked.dxf");
   let drawing = Drawing::load_file(path).expect("load fixture");
-  let pieces = extract(&drawing, Sources::Layer);
+  let (pieces, _diags) = extract(&drawing, Sources::Layer);
   assert!(!pieces.is_empty());
 
   let mut polygons = 0;

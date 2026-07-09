@@ -18,7 +18,7 @@ fn fixture() -> Drawing {
 #[test]
 fn pipeline_preserves_geometry_and_avoids_overlap() {
   let drawing = fixture();
-  let pieces = extract(&drawing, Sources::Both);
+  let (pieces, _diags) = extract(&drawing, Sources::Both);
 
   // Per-part parts (multi-part layers split) + 6 block inserts.
   assert!(pieces.len() >= 60, "expected many parts, got {}", pieces.len());
@@ -92,7 +92,7 @@ fn pipeline_preserves_geometry_and_avoids_overlap() {
     .iter()
     .map(|p| p.to_placed(&bboxes[p.piece_index]))
     .collect();
-  let report = emit(&drawing, &pieces, &placed, &out_dir, "gengar").expect("emit");
+  let report = emit(&drawing, &pieces, &placed, &out_dir, "gengar", 0.0).expect("emit");
 
   let mut splines = 0;
   let mut inserts = 0;

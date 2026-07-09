@@ -33,7 +33,7 @@ fn circle_and_line_geometry_survives_and_moves() {
     "edge",
   ));
 
-  let pieces = extract(&drawing, Sources::Both);
+  let (pieces, _diags) = extract(&drawing, Sources::Both);
   assert_eq!(pieces.len(), 2, "circle and line should each form a piece");
 
   // The circle forms its own part with the full 40x40 bbox (r=20), not
@@ -61,7 +61,7 @@ fn circle_and_line_geometry_survives_and_moves() {
     .iter()
     .map(|p| p.to_placed(&bboxes[p.piece_index]))
     .collect();
-  let report = emit(&drawing, &pieces, &placed, &out_dir, "geo").expect("emit");
+  let report = emit(&drawing, &pieces, &placed, &out_dir, "geo", 0.0).expect("emit");
 
   // Reload and confirm the circle survives, keeps its radius, and was moved
   // onto the sheet (its original centre at 900,900 is off any 400mm sheet).

@@ -190,6 +190,113 @@ pub(crate) fn point_in_ring(pt: [f64; 2], ring: &[[f64; 2]]) -> bool {
   inside
 }
 
+/// Signed shoelace area of a ring (positive when wound counter-clockwise).
+pub(crate) fn signed_area(ring: &[[f64; 2]]) -> f64 {
+  let n = ring.len();
+  if n < 3 {
+    return 0.0;
+  }
+  let mut a = 0.0;
+  for i in 0..n {
+    let j = (i + 1) % n;
+    a += ring[i][0] * ring[j][1] - ring[j][0] * ring[i][1];
+  }
+  a / 2.0
+}
+
+/// Offset a closed simple ring by signed distance `d`: `d > 0` moves every edge
+/// outward (expanding the enclosed area), `d < 0` inward (contracting it). Each
+/// edge is shifted along its outward normal and consecutive offset edges are
+/// re-intersected to form the new vertices. Robust for the tiny offsets kerf
+/// compensation uses (half the beam width, well below feature size).
+pub fn offset_ring(ring: &[[f64; 2]], d: f64) -> Ring {
+  let mut r: Vec<[f64; 2]> = ring.to_vec();
+  // Drop a duplicated closing vertex so edges aren't degenerate.
+  if r.len() >= 2 {
+    let (a, b) = (r[0], r[r.len() - 1]);
+    if (a[0] - b[0]).hypot(a[1] - b[1]) < 1e-9 {
+      r.pop();
+    }
+  }
+  let n = r.len();
+  if n < 3 || d == 0.0 {
+    return r;
+  }
+  // Outward normal for a CCW ring is the right-hand normal (dy, -dx); flip for a
+  // CW ring so `d > 0` always expands the enclosed area regardless of winding.
+  let sign = if signed_area(&r) >= 0.0 { 1.0 } else { -1.0 };
+  // Offset line of edge i (r[i] -> r[i+1]) as (point-on-line, unit direction).
+  let edge = |i: usize| -> ([f64; 2], [f64; 2]) {
+    let a = r[i];
+    let b = r[(i + 1) % n];
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+    let dir = [dx / len, dy / len];
+    let nrm = [sign * dir[1], -sign * dir[0]];
+    ([a[0] + nrm[0] * d, a[1] + nrm[1] * d], dir)
+  };
+  // Cap how far a vertex may move relative to the offset distance. Without this,
+  // a sharp convex corner's mitre shoots out toward infinity as the angle
+  // narrows; the limit bevels it instead, bounding how much the outline grows.
+  const MITRE: f64 = 2.0;
+  let limit = MITRE * d.abs();
+  let mut out = Vec::with_capacity(n);
+  // Index-based: each new vertex needs its two neighbouring edges (wrapping).
+  #[allow(clippy::needless_range_loop)]
+  for j in 0..n {
+    let (p1, d1) = edge((j + n - 1) % n);
+    let (p2, d2) = edge(j);
+    // Intersect the two offset lines: P1 + t·d1 = P2 + s·d2.
+    let det = d2[0] * d1[1] - d2[1] * d1[0];
+    let q = if det.abs() < 1e-9 {
+      // (Near-)collinear edges: the offset lines coincide; the offset vertex is
+      // the start of edge j's offset line.
+      p2
+    } else {
+      let (dpx, dpy) = (p2[0] - p1[0], p2[1] - p1[1]);
+      let t = (d2[0] * dpy - d2[1] * dpx) / det;
+      [p1[0] + d1[0] * t, p1[1] + d1[1] * t]
+    };
+    // Apply the mitre limit, measured from the original vertex.
+    let (vx, vy) = (q[0] - r[j][0], q[1] - r[j][1]);
+    let dist = (vx * vx + vy * vy).sqrt();
+    if dist > limit && dist > 1e-12 {
+      let s = limit / dist;
+      out.push([r[j][0] + vx * s, r[j][1] + vy * s]);
+    } else {
+      out.push(q);
+    }
+  }
+  out
+}
+
+/// Kerf-compensate a piece's rings: each ring is offset by `half` (half the beam
+/// width) outward if it is solid material and inward if it is a hole. Solid vs
+/// hole is decided by containment-depth parity (a ring at even depth is solid, a
+/// ring nested one level deeper is its hole), matching how parts are extracted.
+pub fn compensate_rings(rings: &[Ring], half: f64) -> Vec<Ring> {
+  let n = rings.len();
+  let areas: Vec<f64> = rings.iter().map(|r| if r.len() >= 3 { area(r) } else { 0.0 }).collect();
+  let contains = |j: usize, i: usize| -> bool {
+    j != i
+      && rings[j].len() >= 3
+      && rings[i].len() >= 3
+      && areas[j] > areas[i]
+      && rings[i].iter().all(|&p| point_in_ring(p, &rings[j]))
+  };
+  (0..n)
+    .map(|i| {
+      if rings[i].len() < 3 {
+        return rings[i].clone();
+      }
+      let depth = (0..n).filter(|&j| contains(j, i)).count();
+      // Even depth = solid (grow outward, +half); odd = hole (shrink, -half).
+      let d = if depth.is_multiple_of(2) { half } else { -half };
+      offset_ring(&rings[i], d)
+    })
+    .collect()
+}
+
 /// Andrew's monotone-chain convex hull. Always yields a simple polygon, so it
 /// is the safe fallback when a concave outline can't be used directly.
 pub fn convex_hull(mut pts: Vec<[f64; 2]>) -> Ring {

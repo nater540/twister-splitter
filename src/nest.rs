@@ -7,7 +7,9 @@
 //! above bounding-box packing but below jagua's research-grade optimizer
 //! (`sparrow`); a metaheuristic could be swapped in later behind this seam.
 
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::PI;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use jagua_rs::collision_detection::CDEConfig;
 use jagua_rs::collision_detection::hazards::filter::NoFilter;
@@ -19,8 +21,8 @@ use jagua_rs::geometry::primitives::{Point, SPolygon};
 use jagua_rs::geometry::{DTransformation, Transformation};
 use jagua_rs::io::export::int_to_ext_transformation;
 use jagua_rs::io::ext_repr::{ExtContainer, ExtItem as BaseExtItem, ExtSPolygon, ExtShape};
-use jagua_rs::io::import::Importer;
-use jagua_rs::probs::bpp::entities::{BPLayoutType, BPPlacement, BPProblem};
+use jagua_rs::io::import::{Importer, ext_to_int_transformation};
+use jagua_rs::probs::bpp::entities::{BPLayoutType, BPPlacement, BPProblem, LayKey};
 use jagua_rs::probs::bpp::io::ext_repr::{ExtBPInstance, ExtBin, ExtItem as BpItem};
 use jagua_rs::probs::bpp::io::import_instance;
 
@@ -29,19 +31,38 @@ use dxf::Drawing;
 use crate::emit::Placed;
 use crate::extract::{Piece, PieceKind};
 use crate::flatten;
-use crate::geom::Affine;
+use crate::geom::{Affine, Bbox};
 
 /// A piece's nesting polygon, tagged with the piece it belongs to.
+#[derive(Clone)]
 pub struct NestItem {
   pub piece_index: usize,
   /// Outline in the piece's own coordinate frame (same frame as its entities).
   pub polygon: Vec<[f64; 2]>,
+  /// True when `polygon` is non-simple (self-intersecting after flattening), so
+  /// the nester reserves its convex hull instead. Such a piece reserves *more*
+  /// than its real outline; the UI can badge it so the slot looks under-filled
+  /// for a reason.
+  pub hull_fallback: bool,
+}
+
+/// Flatten every piece to a single nesting polygon that contains all of its
+/// geometry (see [`build_items_with`]; kerf compensation off).
+pub fn build_items(drawing: &Drawing, pieces: &[Piece]) -> Vec<NestItem> {
+  build_items_with(drawing, pieces, 0.0)
 }
 
 /// Flatten every piece to a single nesting polygon that contains all of its
 /// geometry. A piece with no substantial outline falls back to its bounding-box
 /// rectangle so it still nests rather than being treated as unplaceable.
-pub fn build_items(drawing: &Drawing, pieces: &[Piece]) -> Vec<NestItem> {
+///
+/// When `kerf_comp > 0`, the emitted cut outline is offset outward by
+/// `kerf_comp / 2` (kerf compensation). The reservation is then built from the
+/// *compensated* rings, so `piece_polygon`'s containment guarantee covers the
+/// enlarged outline — otherwise the compensated (larger) cut could spill past
+/// its slot into a neighbour.
+pub fn build_items_with(drawing: &Drawing, pieces: &[Piece], kerf_comp: f64) -> Vec<NestItem> {
+  let half = (kerf_comp * 0.5).max(0.0);
   pieces
     .iter()
     .enumerate()
@@ -61,21 +82,46 @@ pub fn build_items(drawing: &Drawing, pieces: &[Piece]) -> Vec<NestItem> {
           }
         }
       }
+      // Reserve from the compensated rings so the enlarged outline is contained.
+      if half > 0.0 {
+        rings = flatten::compensate_rings(&rings, half);
+      }
       let polygon = flatten::piece_polygon(&rings, 4.0, 0.4).unwrap_or_else(|| {
-        let b = &piece.bbox;
+        // No usable outline: reserve a rectangle. With compensation on, emit
+        // outputs the compensated rings as polylines, so reserve THEIR bbox (the
+        // piece bbox is the pre-compensation extent and could be too small). With
+        // compensation off, emit outputs the original entities, so the piece bbox
+        // (a control-point over-estimate) is the safe reservation.
+        let mut bb = Bbox::empty();
+        if half > 0.0 {
+          for r in &rings {
+            for &[x, y] in r {
+              bb.add_point(x, y);
+            }
+          }
+        }
+        if bb.is_empty() {
+          bb = piece.bbox;
+        }
         vec![
-          [b.min_x, b.min_y],
-          [b.max_x, b.min_y],
-          [b.max_x, b.max_y],
-          [b.min_x, b.max_y],
+          [bb.min_x, bb.min_y],
+          [bb.max_x, bb.min_y],
+          [bb.max_x, bb.max_y],
+          [bb.min_x, bb.max_y],
         ]
       });
-      NestItem { piece_index: i, polygon }
+      // Record up-front whether jagua will reject this ring as non-simple (so it
+      // is nested by its hull). Same test `valid_ring_or_hull` applies, but done
+      // here it can be reported per-piece rather than as an aggregate count.
+      let pts: Vec<Point> = polygon.iter().map(|&[x, y]| Point(x as f32, y as f32)).collect();
+      let hull_fallback = SPolygon::new(pts).is_err();
+      NestItem { piece_index: i, polygon, hull_fallback }
     })
     .collect()
 }
 
 /// Outcome of a nesting run.
+#[derive(Clone)]
 pub struct NestResult {
   /// Placed pieces, one per fitted item, transform in original coordinates.
   pub placed: Vec<Placed>,
@@ -83,6 +129,9 @@ pub struct NestResult {
   pub sheets: usize,
   /// Piece indices that did not fit on any sheet (too large even rotated).
   pub oversized: Vec<usize>,
+  /// Piece indices left unplaced because the run was cancelled before reaching
+  /// them (empty on a run that finished normally).
+  pub unplaced: Vec<usize>,
 }
 
 /// Return `polygon` as an `(f32,f32)` ring if jagua accepts it as a simple
@@ -116,26 +165,19 @@ fn cde_config() -> CDEConfig {
 const N_ROT: usize = 24; // rotation samples for continuous rotation
 const GRID: usize = 48; // translation grid resolution per axis
 
-/// Nest `items` onto `sheet_w` x `sheet_h` sheets with a `kerf` gap.
-///
-/// `progress` is invoked as each piece is placed with `(done, total)`, so a
-/// caller can drive a progress bar without the library depending on any UI.
-pub fn nest(
+/// Build a jagua bin-packing instance from `items` on `sheet_w`×`sheet_h` sheets
+/// with a `kerf` separation and a `margin` edge inset (shared by `nest` and
+/// `nest_pinned`). Every polygon is gated through jagua's `SPolygon` validator;
+/// a rejected (self-intersecting) ring falls back to its convex hull, so import
+/// never fails on a bad ring. Hull fallbacks are surfaced per-piece via
+/// `NestItem::hull_fallback`, so nothing is printed here.
+fn build_bpp_instance(
   items: &[NestItem],
   sheet_w: f64,
   sheet_h: f64,
   kerf: f64,
-  mut progress: impl FnMut(usize, usize),
-) -> Result<NestResult, String> {
-  if items.is_empty() {
-    return Ok(NestResult { placed: vec![], sheets: 0, oversized: vec![] });
-  }
-
-  // --- build the jagua instance -------------------------------------------
-  // Gate every polygon through jagua's own SPolygon validator; if it rejects a
-  // ring (self-intersecting after flattening/simplification), fall back to the
-  // convex hull, which is always a valid simple polygon. This guarantees the
-  // instance import never fails on a bad ring.
+  margin: f64,
+) -> Result<jagua_rs::probs::bpp::entities::BPInstance, String> {
   let mut hull_fallbacks = 0usize;
   let ext_items: Vec<BpItem> = items
     .iter()
@@ -153,20 +195,17 @@ pub fn nest(
       }
     })
     .collect();
-  if hull_fallbacks > 0 {
-    eprintln!(
-      "note: {hull_fallbacks} piece(s) had a non-simple outline and were nested by their convex hull"
-    );
-  }
 
+  // Inset the container by the edge margin so nothing is placed in the margin.
+  let margin = margin.max(0.0) as f32;
   let bins = vec![ExtBin {
     base: ExtContainer {
       id: 0,
       shape: ExtShape::Rectangle {
-        x_min: 0.0,
-        y_min: 0.0,
-        width: sheet_w as f32,
-        height: sheet_h as f32,
+        x_min: margin,
+        y_min: margin,
+        width: (sheet_w as f32 - 2.0 * margin).max(0.0),
+        height: (sheet_h as f32 - 2.0 * margin).max(0.0),
       },
       zones: vec![],
     },
@@ -176,13 +215,34 @@ pub fn nest(
 
   let separation = if kerf > 0.0 { Some(kerf as f32) } else { None };
   let importer = Importer::new(cde_config(), None, separation, None);
-  let instance = import_instance(
-    &importer,
-    &ExtBPInstance { name: "twister".into(), items: ext_items, bins },
-  )
-  .map_err(|e| format!("jagua instance import failed: {e}"))?;
+  import_instance(&importer, &ExtBPInstance { name: "twister".into(), items: ext_items, bins })
+    .map_err(|e| format!("jagua instance import failed: {e}"))
+}
+
+/// Nest `items` onto `sheet_w` x `sheet_h` sheets with a `kerf` gap.
+///
+/// `progress` is invoked as each piece is placed with `(done, total)`, so a
+/// caller can drive a progress bar without the library depending on any UI.
+/// `cancel`, when set true, stops the loop at the next piece boundary and
+/// returns a partial result (remaining pieces go in `NestResult::unplaced`).
+/// `margin` reserves a usable inset (mm) on every sheet edge by nesting into an
+/// inset container, so no part sits in the margin band.
+#[allow(clippy::too_many_arguments)]
+pub fn nest(
+  items: &[NestItem],
+  sheet_w: f64,
+  sheet_h: f64,
+  kerf: f64,
+  margin: f64,
+  cancel: Option<&AtomicBool>,
+  mut progress: impl FnMut(usize, usize),
+) -> Result<NestResult, String> {
+  if items.is_empty() {
+    return Ok(NestResult { placed: vec![], sheets: 0, oversized: vec![], unplaced: vec![] });
+  }
 
   // --- greedy placement, largest piece first ------------------------------
+  let instance = build_bpp_instance(items, sheet_w, sheet_h, kerf, margin)?;
   let mut prob = BPProblem::new(instance);
   let mut order: Vec<usize> = (0..items.len()).collect();
   order.sort_by(|&a, &b| {
@@ -193,11 +253,21 @@ pub fn nest(
 
   let total = order.len();
   let mut oversized = Vec::new();
-  for (done, id) in order.into_iter().enumerate() {
+  let mut unplaced = Vec::new();
+  let mut canceled_at = None;
+  for (done, id) in order.iter().copied().enumerate() {
+    // Cooperative cancellation: stop at the next piece boundary.
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+      canceled_at = Some(done);
+      break;
+    }
     if !place_greedy(&mut prob, id, GRID) {
       oversized.push(items[id].piece_index);
     }
     progress(done + 1, total);
+  }
+  if let Some(from) = canceled_at {
+    unplaced.extend(order[from..].iter().map(|&id| items[id].piece_index));
   }
 
 
@@ -224,11 +294,176 @@ pub fn nest(
           ty: ty as f64,
         },
         oversized: false,
+        locked: false,
       });
     }
   }
 
-  Ok(NestResult { placed, sheets, oversized })
+  Ok(NestResult { placed, sheets, oversized, unplaced })
+}
+
+/// Re-nest around pinned placements (P2-9). `fixed` are placements the user has
+/// locked: they are inserted into the jagua bin-packing model as immovable
+/// obstacles, and the remaining (free) pieces are packed around them. This is
+/// the jagua path rather than sparrow, because sparrow strip-packing cannot take
+/// pre-placed obstacles.
+///
+/// Guarantees (see `tests/pin_renest.rs`):
+/// * **Locked pieces are byte-identical.** Their `Placed` is copied straight
+///   through to the output; jagua is used only to make them collision hazards,
+///   never to recompute their transform or sheet.
+/// * **No overlap.** Free pieces are placed through jagua's collision engine,
+///   which rejects any position overlapping a locked hazard, another free piece,
+///   or the (margin-inset) sheet boundary.
+///
+/// `items` covers *all* pieces (locked and free); the free set is `items` whose
+/// `piece_index` is not among `fixed`. A free piece too large to fit is returned
+/// in `NestResult::oversized`; on cancellation the unreached free pieces go to
+/// `unplaced`.
+#[allow(clippy::too_many_arguments)]
+pub fn nest_pinned(
+  items: &[NestItem],
+  fixed: &[Placed],
+  sheet_w: f64,
+  sheet_h: f64,
+  kerf: f64,
+  margin: f64,
+  cancel: Option<&AtomicBool>,
+  mut progress: impl FnMut(usize, usize),
+) -> Result<NestResult, String> {
+  if items.is_empty() {
+    return Ok(NestResult { placed: vec![], sheets: 0, oversized: vec![], unplaced: vec![] });
+  }
+
+  let instance = build_bpp_instance(items, sheet_w, sheet_h, kerf, margin)?;
+  let mut prob = BPProblem::new(instance);
+
+  // piece_index -> jagua item id (items are imported in `items` order).
+  let piece_to_item: HashMap<usize, usize> =
+    items.iter().enumerate().map(|(i, it)| (it.piece_index, i)).collect();
+  let locked_pieces: HashSet<usize> = fixed.iter().map(|p| p.piece_index).collect();
+  // Every sheet a locked piece sits on is reserved: no free piece may be numbered
+  // onto it unless it is physically placed into that same locked layout.
+  let locked_sheets: HashSet<usize> = fixed.iter().map(|p| p.sheet).collect();
+
+  // Insert each non-oversized locked piece as a forced obstacle, grouping all
+  // locked pieces of one sheet into a single jagua layout. Oversized locked
+  // pieces are NOT inserted (they own an isolated sheet); their `Placed` still
+  // flows through unchanged and their sheet stays reserved.
+  let mut sheet_layout: HashMap<usize, LayKey> = HashMap::new();
+  let mut locked_item_sheet: HashMap<usize, usize> = HashMap::new();
+  let mut fixed_sorted: Vec<&Placed> = fixed.iter().filter(|p| !p.oversized).collect();
+  fixed_sorted.sort_by_key(|p| p.sheet);
+  for f in fixed_sorted {
+    let Some(&item_id) = piece_to_item.get(&f.piece_index) else { continue };
+    // Convert the locked placement (an external, absolute-sheet transform) into
+    // jagua's internal frame via the item's pre-transform — the exact inverse of
+    // the `int_to_ext_transformation` used to read placements back out.
+    let pre = prob.instance.item(item_id).shape_orig.pre_transform;
+    let ext_dt = DTransformation::new(
+      f.transform.rotation() as f32,
+      (f.transform.tx as f32, f.transform.ty as f32),
+    );
+    let int_dt = ext_to_int_transformation(&ext_dt, &pre);
+    let layout_id = match sheet_layout.get(&f.sheet) {
+      Some(&lk) => BPLayoutType::Open(lk),
+      None => BPLayoutType::Closed { bin_id: 0 },
+    };
+    let (lk, _) = prob.place_item(BPPlacement { layout_id, item_id, d_transf: int_dt });
+    sheet_layout.entry(f.sheet).or_insert(lk);
+    locked_item_sheet.insert(item_id, f.sheet);
+  }
+
+  // Greedily place the free pieces (largest first) around the locked obstacles.
+  let mut order: Vec<usize> = (0..items.len())
+    .filter(|&i| !locked_pieces.contains(&items[i].piece_index))
+    .collect();
+  order.sort_by(|&a, &b| {
+    let da = prob.instance.item(a).shape_cd.diameter;
+    let db = prob.instance.item(b).shape_cd.diameter;
+    db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+  });
+
+  let total = order.len();
+  let mut oversized = Vec::new();
+  let mut unplaced = Vec::new();
+  let mut canceled_at = None;
+  for (done, id) in order.iter().copied().enumerate() {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+      canceled_at = Some(done);
+      break;
+    }
+    if !place_greedy(&mut prob, id, GRID) {
+      oversized.push(items[id].piece_index);
+    }
+    progress(done + 1, total);
+  }
+  if let Some(from) = canceled_at {
+    unplaced.extend(order[from..].iter().map(|&id| items[id].piece_index));
+  }
+
+  // --- read back ----------------------------------------------------------
+  // Locked pieces flow through byte-identical; only free pieces are read from
+  // jagua. Each layout's output sheet index is the reserved sheet of the locked
+  // piece it holds, or the lowest unused index for a fresh (free-only) layout.
+  let mut layout_sheet: HashMap<LayKey, usize> = HashMap::new();
+  let mut fresh: Vec<(f64, f64, LayKey)> = Vec::new();
+  for (lk, layout) in prob.layouts.iter() {
+    let locked = layout
+      .placed_items
+      .values()
+      .find_map(|pi| locked_item_sheet.get(&pi.item_id).copied());
+    match locked {
+      Some(s) => {
+        layout_sheet.insert(lk, s);
+      }
+      None => {
+        // Deterministic sheet numbering: order fresh layouts by min corner.
+        let (mut mnx, mut mny) = (f64::MAX, f64::MAX);
+        for pi in layout.placed_items.values() {
+          let ext = int_to_ext_transformation(&pi.d_transf, &prob.instance.item(pi.item_id).shape_orig.pre_transform);
+          let (tx, ty) = ext.translation();
+          mnx = mnx.min(tx as f64);
+          mny = mny.min(ty as f64);
+        }
+        fresh.push((mnx, mny, lk));
+      }
+    }
+  }
+  fresh.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+  let mut next = 0usize;
+  for (_, _, lk) in &fresh {
+    while locked_sheets.contains(&next) {
+      next += 1;
+    }
+    layout_sheet.insert(*lk, next);
+    next += 1;
+  }
+
+  // Locked placements pass through unchanged (byte-identical).
+  let mut placed: Vec<Placed> = fixed.to_vec();
+  for (lk, layout) in prob.layouts.iter() {
+    let sheet = layout_sheet[&lk];
+    for pi in layout.placed_items.values() {
+      let piece_index = items[pi.item_id].piece_index;
+      if locked_pieces.contains(&piece_index) {
+        continue; // locked: already emitted from `fixed`
+      }
+      let ext = int_to_ext_transformation(&pi.d_transf, &prob.instance.item(pi.item_id).shape_orig.pre_transform);
+      let theta = ext.rotation() as f64;
+      let (tx, ty) = ext.translation();
+      let (s, c) = theta.sin_cos();
+      placed.push(Placed {
+        piece_index,
+        sheet,
+        transform: Affine { m00: c, m01: -s, m10: s, m11: c, tx: tx as f64, ty: ty as f64 },
+        oversized: false,
+        locked: false,
+      });
+    }
+  }
+  let sheets = placed.iter().map(|p| p.sheet).max().map_or(0, |m| m + 1);
+  Ok(NestResult { placed, sheets, oversized, unplaced })
 }
 
 /// Bottom-left objective: heavily weight leftward, then downward, so pieces

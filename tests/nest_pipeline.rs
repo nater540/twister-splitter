@@ -73,7 +73,7 @@ fn collect_xy(e: &dxf::entities::Entity, out: &mut Vec<(f64, f64)>) {
 fn nesting_places_all_pieces_within_bounds() {
   let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/gengar-stacked.dxf");
   let drawing = Drawing::load_file(path).expect("load fixture");
-  let pieces = extract(&drawing, Sources::Both);
+  let (pieces, _diags) = extract(&drawing, Sources::Both);
   // Per-part extraction splits multi-part layers, so there are more pieces than
   // layers; exact count depends on flattening, so assert a robust lower bound.
   let n_pieces = pieces.len();
@@ -82,7 +82,7 @@ fn nesting_places_all_pieces_within_bounds() {
   let items = nest::build_items(&drawing, &pieces);
   assert_eq!(items.len(), n_pieces, "every piece should produce a nesting polygon");
 
-  let result = nest::nest(&items, SHEET, SHEET, KERF, |_, _| {}).expect("nest");
+  let result = nest::nest(&items, SHEET, SHEET, KERF, 0.0, None, |_, _| {}).expect("nest");
 
   // Assemble the full placement set (fitted + oversized on their own sheets),
   // mirroring what the CLI does.
@@ -96,6 +96,7 @@ fn nesting_places_all_pieces_within_bounds() {
       sheet,
       transform: Affine::place(&pieces[pi].bbox, 0.0, 0.0, 0.0),
       oversized: true,
+      locked: false,
     });
   }
 
@@ -112,7 +113,7 @@ fn nesting_places_all_pieces_within_bounds() {
   // Emit, reload, and check bounds + geometry preservation.
   let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-nest");
   let _ = std::fs::remove_dir_all(&out_dir);
-  let report = emit(&drawing, &pieces, &placed, &out_dir, "gengar").expect("emit");
+  let report = emit(&drawing, &pieces, &placed, &out_dir, "gengar", 0.0).expect("emit");
 
   let oversized_files: Vec<usize> = oversized_sheets.clone();
   let (mut splines, mut inserts, mut polylines) = (0, 0, 0);

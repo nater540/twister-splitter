@@ -12,15 +12,18 @@
 //! outlines we already cut), and the `dxf` crate does not surface them anyway.
 
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 
 use crate::flatten;
 
 use dxf::Drawing;
 use dxf::entities::{Entity, EntityType};
 
+use crate::diag::Diagnostic;
 use crate::geom::Bbox;
 
 /// What a piece is made of.
+#[derive(Clone)]
 pub enum PieceKind {
   /// A group of loose entities that shared a DXF layer, in world coordinates.
   Loose(Vec<Entity>),
@@ -29,12 +32,91 @@ pub enum PieceKind {
   Insert { insert: Box<Entity>, block_name: String },
 }
 
+/// Where a piece came from: a connected part of loose outline geometry, or a
+/// block reference (INSERT). Lets the UI group/filter Part vs Block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PieceSource {
+  Part,
+  Block,
+}
+
+#[derive(Clone)]
 pub struct Piece {
-  /// Human-readable label, e.g. `layer:Vector layer_3` or `block:Block_0`.
+  /// Human-readable label, e.g. `part:0` or `block:Block_0`.
   pub label: String,
   pub kind: PieceKind,
   /// Local bounding box (in the coordinates the geometry currently lives in).
   pub bbox: Bbox,
+  /// True outline area (outer contour minus its holes), in DXF units².
+  pub area: f64,
+  /// Whether this piece is a loose part or a block reference.
+  pub source: PieceSource,
+  /// Content-derived identity, stable across re-extraction of the same input
+  /// (unlike `label`/index, which shift when the source filter changes). Two
+  /// geometrically-identical pieces get distinct ids via an occurrence counter.
+  pub id: u64,
+}
+
+impl Piece {
+  /// The piece's outline rings in its own (local) coordinate frame. Loose parts
+  /// return their entities' rings; an INSERT resolves its block's entities. The
+  /// place transform is rigid, so applying it to these rings yields the sheet
+  /// geometry.
+  pub fn rings(&self, drawing: &Drawing) -> Vec<Vec<[f64; 2]>> {
+    let mut rings = Vec::new();
+    match &self.kind {
+      PieceKind::Loose(entities) => {
+        for e in entities {
+          flatten::entity_rings(e, &mut rings);
+        }
+      }
+      PieceKind::Insert { block_name, .. } => {
+        if let Some(b) = drawing.blocks().find(|b| &b.name == block_name) {
+          for e in &b.entities {
+            flatten::entity_rings(e, &mut rings);
+          }
+        }
+      }
+    }
+    rings
+  }
+}
+
+/// True outline area of a set of rings: the largest ring (outer contour) minus
+/// every other ring (treated as holes). Matches how the piece is cut.
+fn outline_area(rings: &[Vec<[f64; 2]>]) -> f64 {
+  let mut areas: Vec<f64> = rings
+    .iter()
+    .map(|r| if r.len() >= 3 { flatten::area(r) } else { 0.0 })
+    .collect();
+  let Some((outer_i, &outer)) = areas
+    .iter()
+    .enumerate()
+    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+  else {
+    return 0.0;
+  };
+  areas[outer_i] = 0.0;
+  (outer - areas.iter().sum::<f64>()).max(0.0)
+}
+
+/// A stable content hash for a piece: block name or the rounded outer geometry,
+/// mixed with an occurrence counter so identical duplicates stay distinct.
+fn piece_id(kind: &PieceKind, bbox: &Bbox, area: f64, occurrence: u64) -> u64 {
+  let mut h = std::collections::hash_map::DefaultHasher::new();
+  match kind {
+    PieceKind::Loose(_) => 0u8.hash(&mut h),
+    PieceKind::Insert { block_name, .. } => {
+      1u8.hash(&mut h);
+      block_name.hash(&mut h);
+    }
+  }
+  // Quantise geometry so floating-point jitter across loads doesn't shift ids.
+  for v in [bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y, area] {
+    ((v * 100.0).round() as i64).hash(&mut h);
+  }
+  occurrence.hash(&mut h);
+  h.finish()
 }
 
 /// Accumulate a single entity's cut geometry into `bbox`.
@@ -110,8 +192,16 @@ pub enum Sources {
 }
 
 /// Extract all pieces from a drawing according to `sources`.
-pub fn extract(drawing: &Drawing, sources: Sources) -> Vec<Piece> {
+///
+/// Returns the pieces plus any [`Diagnostic`]s (skipped inserts, non-unit
+/// scales, dropped degenerate parts) for the caller to surface — the library
+/// never prints.
+pub fn extract(drawing: &Drawing, sources: Sources) -> (Vec<Piece>, Vec<Diagnostic>) {
   let mut pieces = Vec::new();
+  let mut diags = Vec::new();
+  // Occurrence counters keyed by (content) so identical duplicate pieces get
+  // distinct stable ids.
+  let mut occ: BTreeMap<u64, u64> = BTreeMap::new();
 
   // Bounding boxes of every block definition, keyed by block name, so INSERT
   // pieces can be sized from the geometry they reference.
@@ -136,8 +226,11 @@ pub fn extract(drawing: &Drawing, sources: Sources) -> Vec<Piece> {
       let block_name = insert.name.clone();
       let bbox = block_bbox.get(&block_name).copied().unwrap_or_else(Bbox::empty);
       if bbox.is_empty() {
-        eprintln!(
-          "warning: INSERT of block '{block_name}' has no cut geometry; skipping"
+        diags.push(
+          Diagnostic::warning(format!(
+            "INSERT of block '{block_name}' has no cut geometry; skipping"
+          ))
+          .for_piece(format!("block:{block_name}")),
         );
         continue;
       }
@@ -147,19 +240,35 @@ pub fn extract(drawing: &Drawing, sources: Sources) -> Vec<Piece> {
       let non_unit_scale = (insert.x_scale_factor - 1.0).abs() > 1e-9
         || (insert.y_scale_factor - 1.0).abs() > 1e-9;
       if non_unit_scale {
-        eprintln!(
-          "warning: INSERT of block '{block_name}' has a non-unit scale \
-           ({:.3}x{:.3}); nesting assumes unit scale and its footprint may be wrong",
-          insert.x_scale_factor, insert.y_scale_factor
+        diags.push(
+          Diagnostic::warning(format!(
+            "INSERT of block '{block_name}' has a non-unit scale \
+             ({:.3}x{:.3}); nesting assumes unit scale and its footprint may be wrong",
+            insert.x_scale_factor, insert.y_scale_factor
+          ))
+          .for_piece(format!("block:{block_name}")),
         );
       }
+      // True cut area from the block's own rings (outer minus holes).
+      let mut rings = Vec::new();
+      if let Some(b) = drawing.blocks().find(|b| b.name == block_name) {
+        for e in &b.entities {
+          flatten::entity_rings(e, &mut rings);
+        }
+      }
+      let area = outline_area(&rings);
+      let kind = PieceKind::Insert { insert: Box::new(entity.clone()), block_name: block_name.clone() };
+      let content = piece_id(&kind, &bbox, area, 0);
+      let n = occ.entry(content).or_insert(0);
+      let id = piece_id(&kind, &bbox, area, *n);
+      *n += 1;
       pieces.push(Piece {
         label: format!("block:{block_name}"),
-        kind: PieceKind::Insert {
-          insert: Box::new(entity.clone()),
-          block_name,
-        },
+        kind,
         bbox,
+        area,
+        source: PieceSource::Block,
+        id,
       });
     } else if is_outline(entity) {
       if sources == Sources::Block {
@@ -186,17 +295,32 @@ pub fn extract(drawing: &Drawing, sources: Sources) -> Vec<Piece> {
       dropped += 1;
       continue;
     }
+    let mut rings = Vec::new();
+    for e in &entities {
+      flatten::entity_rings(e, &mut rings);
+    }
+    let area = outline_area(&rings);
+    let kind = PieceKind::Loose(entities);
+    let content = piece_id(&kind, &bbox, area, 0);
+    let occn = occ.entry(content).or_insert(0);
+    let id = piece_id(&kind, &bbox, area, *occn);
+    *occn += 1;
     pieces.push(Piece {
       label: format!("part:{n}"),
-      kind: PieceKind::Loose(entities),
+      kind,
       bbox,
+      area,
+      source: PieceSource::Part,
+      id,
     });
   }
   if dropped > 0 {
-    eprintln!("note: dropped {dropped} degenerate part(s) with no cuttable area");
+    diags.push(Diagnostic::info(format!(
+      "dropped {dropped} degenerate part(s) with no cuttable area"
+    )));
   }
 
-  pieces
+  (pieces, diags)
 }
 
 /// Group outline entities into connected parts by ring containment.
