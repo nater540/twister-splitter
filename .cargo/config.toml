@@ -1,8 +1,0 @@
-# Windows cross-compilation settings. Scoped to the target triple, so native
-# builds and `cargo test` on macOS/Linux are unaffected.
-[target.x86_64-pc-windows-gnu]
-linker = "x86_64-w64-mingw32-gcc"
-# `-static` statically links the MinGW runtime (libgcc, libstdc++, libwinpthread)
-# so the resulting .exe has no third-party DLL dependencies and runs on a stock
-# Windows 10 machine as-is.
-rustflags = ["-C", "link-arg=-static"]

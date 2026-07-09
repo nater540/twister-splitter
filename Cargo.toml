@@ -18,8 +18,24 @@ sparrow = { git = "https://github.com/JeroenGar/sparrow", rev = "961ec31f576c581
 
 # GUI-only dependencies (pulled in only with `--features gui`), so the CLI build
 # stays lean. Glow (OpenGL) backend — 2D painting needs nothing heavier.
+#
+# The GUI deps are split into target-specific tables below so each platform pulls
+# only what it needs (and, crucially, so cross-compiling to Windows drags in NO C
+# dependencies): Windows uses winit's Win32 backend + rfd's native Win32 dialog;
+# Linux uses x11/wayland + a GTK dialog; macOS uses Cocoa. `rfd`'s Win32/Cocoa
+# backends are cfg-gated (not feature-gated), so `default-features = false` is all
+# they need — only Linux requires an explicit dialog backend feature.
+rfd = { version = "0.17", default-features = false, optional = true }
+
+# Windows + macOS: eframe needs no extra windowing features (winit's Win32/Cocoa
+# backends are always compiled). This also covers the Windows cross-compile.
+[target.'cfg(not(all(unix, not(target_os = "macos"))))'.dependencies]
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow"], optional = true }
+
+# Linux/BSD: add the x11 + wayland windowing backends and a GTK file dialog.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"], optional = true }
-rfd = { version = "0.17", optional = true }
+rfd = { version = "0.17", default-features = false, features = ["gtk3"], optional = true }
 
 [features]
 # GUI ships by default (bare `cargo run` opens the window; pass args for the CLI).

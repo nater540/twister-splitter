@@ -130,26 +130,38 @@ in these modules:
 
 ## Cross-compiling for Windows
 
-The tool also runs on Windows 10. A Docker build cross-compiles a **self-contained
-x86_64 .exe** (no DLLs to ship):
+The tool also runs on Windows 10. A Docker build cross-compiles **one
+self-contained x86_64 .exe** (no DLLs to ship) — the GUI-capable dispatcher:
 
 ```
-./build-windows.sh          # -> ./dist/twister-splitter.exe
+./build-windows.sh          # -> ./dist/twister-splitter.exe (opens the GUI on double-click)
 ```
 
-- The Windows build is **CLI-only**: `Dockerfile.windows` builds with
-  `cargo build --release --no-default-features --bin twister-splitter …`, which
-  drops the default `gui` feature (eframe/winit/glow). Without this the GUI stack
-  would pull MinGW C deps into the exe and break the self-contained guarantee (and
-  likely fail to link). The exe is the same lean CLI it has always been.
-- Target is `x86_64-pc-windows-gnu` (MinGW); works because the CLI crate has no C
-  dependencies. `.cargo/config.toml` sets the linker and `-C link-arg=-static`
-  to statically link the MinGW runtime, so the exe needs no `libgcc`/
-  `libwinpthread`/`libstdc++` DLLs on the target machine.
-- `Dockerfile.windows` asserts self-containedness at build time: it dumps the
-  exe's DLL imports and **fails the build** if any MinGW runtime DLL leaked in.
-- The `.cargo/config.toml` settings are scoped to the Windows target triple, so
-  native `cargo build`/`cargo test` on macOS/Linux are unaffected.
+- **Target is `x86_64-pc-windows-msvc` (native MSVC ABI), built with
+  `cargo-xwin`** (`Dockerfile.windows`, base image `messense/cargo-xwin`). xwin
+  downloads the MSVC CRT + Windows SDK, and `lld-link` links — no Windows host
+  needed. The image pins an older stable, so the Dockerfile runs `rustup update
+  stable` first (eframe 0.35 needs rustc ≥ 1.92).
+- **The `twister-splitter` dispatcher builds with the default `gui` feature** (no
+  `--no-default-features` anymore), so double-clicking the exe opens the GUI (a
+  bare launch → GUI; args → CLI, though the CLI is unused on Windows). Only this
+  one binary is shipped — the explicit `twister-gui` binary is not built for
+  Windows (it would be redundant with the dispatcher). Cross-compiling the GUI
+  drags in **no C dependencies** because the GUI deps are split target-specifically
+  in `Cargo.toml` — Windows uses winit's Win32 backend + rfd's native Win32 dialog
+  (Linux keeps x11/wayland + GTK; macOS uses Cocoa). glow links only the system
+  `OPENGL32.dll`.
+- **Self-contained via `crt-static`**: the Dockerfile sets
+  `RUSTFLAGS=-C target-feature=+crt-static`, statically linking the MSVC CRT, so
+  the exe needs **no VC++ Redistributable** — only Windows system DLLs
+  (`KERNEL32`, `USER32`, `GDI32`, `OPENGL32`, …). It asserts this at build time:
+  it dumps the exe's imports and **fails the build** if any VC++ runtime DLL
+  (`vcruntime`/`msvcp`/`api-ms-win-crt`) leaked in.
+- There is no longer a `.cargo/config.toml` (the old MinGW linker block was
+  removed with the toolchain); cargo-xwin drives the linker/rustflags itself.
+- **Note:** the Docker build proves the exe *links* and is self-contained, but
+  real GUI runtime QA still belongs on a Windows box / `windows-latest` CI — an
+  OpenGL GUI under wine (in the cargo-xwin image) is unreliable for visual checks.
 
 ## Notes
 

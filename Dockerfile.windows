@@ -1,45 +1,52 @@
 # syntax=docker/dockerfile:1
 #
-# Cross-compile twister-splitter into a self-contained Windows x86_64 .exe.
+# Cross-compile twister-splitter to a Windows x86_64 (MSVC ABI) .exe using
+# cargo-xwin. Builds the `twister-splitter` dispatcher, which opens the desktop
+# GUI when double-clicked (bare launch → GUI; args → CLI). cargo-xwin downloads
+# the MSVC CRT + Windows SDK via xwin and links with lld-link — no Windows host
+# needed.
 #
 # Build (BuildKit required; on by default in modern Docker):
 #
 #   docker build -f Dockerfile.windows --target export \
 #     --output type=local,dest=./dist .
 #
-# The artifact lands at ./dist/twister-splitter.exe — copy it straight onto a
-# Windows 10 machine and run it; no extra DLLs are needed.
+# Artifact lands at ./dist/twister-splitter.exe. With crt-static (below) it is
+# self-contained — no VC++ Redistributable required on a stock Windows 10 machine.
 
-# rust:1-bookworm tracks the latest stable 1.x, which is >= 1.85 as required by
-# this crate's edition 2024.
-FROM rust:1-bookworm AS builder
+# Prebuilt image with Rust + cargo-xwin + the LLVM toolchain (lld-link, objdump).
+FROM messense/cargo-xwin AS builder
 
-# MinGW-w64 supplies the Windows GNU linker (x86_64-w64-mingw32-gcc).
-RUN apt-get update \
- && apt-get install -y --no-install-recommends mingw-w64 \
- && rm -rf /var/lib/apt/lists/*
+# Statically link the MSVC CRT so the exes need no VC++ Redistributable. cargo-xwin
+# reads RUSTFLAGS and appends its own lib-search paths, so setting it here composes.
+ENV RUSTFLAGS="-C target-feature=+crt-static"
 
-RUN rustup target add x86_64-pc-windows-gnu
+# The base image pins an older stable (1.89); eframe 0.35 needs rustc >= 1.92.
+# Pull the latest stable, then add the Windows target on that toolchain.
+RUN rustup update stable && rustup default stable \
+ && rustup target add x86_64-pc-windows-msvc
 
 WORKDIR /app
 COPY . .
 
-# Cache the registry and target dir between builds. Because cache mounts are not
-# part of the image, copy the finished exe to a normal path for the export stage.
-# `--no-default-features` drops the `gui` feature (eframe/winit/glow), so the
-# Windows exe is the lean CLI only — no MinGW C runtime deps to ship. `--bin
-# twister-splitter` avoids building the GUI-only `twister-gui` binary.
+# `gui` is a default feature, so the dispatcher builds with the GUI baked in (no
+# --features flag). The target-specific deps in Cargo.toml keep the Windows build
+# free of C dependencies (winit Win32 backend + rfd native Win32 dialog).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --no-default-features --bin twister-splitter --target x86_64-pc-windows-gnu \
- && cp target/x86_64-pc-windows-gnu/release/twister-splitter.exe /twister-splitter.exe
+    cargo xwin build --release --target x86_64-pc-windows-msvc \
+      --bin twister-splitter \
+ && cp target/x86_64-pc-windows-msvc/release/twister-splitter.exe /twister-splitter.exe
 
-# Verify the exe is self-contained: print its DLL imports and fail the build if
-# any MinGW runtime DLL leaked in (those would be missing on a stock Windows box).
+# Assert crt-static took: the exe may not import the VC++ runtime DLLs (those are
+# absent on a machine without the redistributable). Windows *system* DLLs
+# (KERNEL32, USER32, OPENGL32, GDI32, COMDLG32, ...) are expected and fine.
 RUN echo "== twister-splitter.exe DLL imports ==" \
- && x86_64-w64-mingw32-objdump -p /twister-splitter.exe | grep "DLL Name" \
- && ! x86_64-w64-mingw32-objdump -p /twister-splitter.exe \
-      | grep -qiE "libgcc|libstdc\+\+|libwinpthread"
+ && llvm-objdump -p /twister-splitter.exe | grep -iE 'DLL Name|\.dll' || true; \
+    if llvm-objdump -p /twister-splitter.exe | grep -qiE 'vcruntime|msvcp[0-9]|api-ms-win-crt'; then \
+      echo "ERROR: twister-splitter.exe imports the VC++ runtime — crt-static did not take"; \
+      exit 1; \
+    fi
 
 # Artifact-only stage: `--target export --output ...` writes just the exe.
 FROM scratch AS export
