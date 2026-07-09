@@ -2,6 +2,7 @@
 name = "twister-splitter"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 # `gui` is a default feature, so both binaries build and `cargo run` is otherwise
 # ambiguous. Pin the default to the CLI/dispatcher binary (it launches the GUI
 # when run with no args — see `main`).
