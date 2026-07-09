@@ -1,6 +1,6 @@
 # Twister Splitter
 
-This is a simple tool I had claude toss togeher in ~a day to help my partner - don't expect anything super high quality here ;)
+This is a simple tool I had claude toss together in ~a day to help my partner - don't expect anything super high quality here ;)
 
 Takes a single DXF of a layered/stacked design — the kind where every piece sits on top of the others at the same spot (a typical Illustrator "Export As DXF" of a stacked laser-cut model) — and does two things:
 
