@@ -1,0 +1,72 @@
+# Windows GUI QA — build and render the desktop GUI on a real Windows runner.
+#
+# The Docker cross-compile (build-windows.sh) proves the exe *links* and is
+# self-contained, but it can't prove the GUI renders. This job does that on
+# native windows-latest (MSVC): the build + library tests are the hard gate, and
+# the wgpu snapshot tests render the actual GUI (via the DX12 WARP software
+# adapter) so a human can eyeball the uploaded screenshots.
+name: Windows GUI QA
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch/PR cancels the in-flight run.
+concurrency:
+  group: windows-gui-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-gui:
+    name: Build & render GUI (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # stable on the Windows runner is the MSVC host toolchain, and tracks a
+      # rustc >= 1.92 (eframe 0.35's minimum).
+      - name: Install Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # HARD GATE: the GUI (twister-gui/twister-splitter) and every test target —
+      # including the egui_kittest + wgpu snapshot code — must compile on the real
+      # Windows MSVC toolchain. This is the regression the Docker cross-compile can
+      # mask, and the most valuable Windows signal.
+      - name: Build all targets (incl. GUI)
+        run: cargo build --locked --all-targets
+
+      # HARD GATE: the library test suite must pass on Windows (catches path /
+      # line-ending / platform issues). The #[ignore]d GPU snapshot tests are
+      # skipped by default here.
+      - name: Test (non-GPU)
+        run: cargo test --locked
+
+      # BEST-EFFORT QA: render the #[ignore]d wgpu snapshot tests on the DX12 WARP
+      # software adapter. Purpose: (a) prove the GUI stack initializes wgpu and
+      # paints without panicking on Windows, and (b) capture Windows-rendered PNGs
+      # for human review. Pixel diffs vs the committed macOS (Metal) references are
+      # EXPECTED — a different renderer — so UPDATE_SNAPSHOTS=1 regenerates instead
+      # of failing on the diff; a genuine crash still fails this step. It's
+      # continue-on-error so a flaky/absent adapter never blocks a PR — the gates
+      # above are the real signal.
+      - name: Render GUI snapshots (WARP software adapter)
+        continue-on-error: true
+        env:
+          UPDATE_SNAPSHOTS: "1"
+          # Force the Microsoft Basic Render Driver (WARP) so wgpu has an adapter
+          # on a GPU-less runner.
+          WGPU_ADAPTER_NAME: "Microsoft Basic Render Driver"
+        run: cargo test --locked -- --ignored
+
+      - name: Upload Windows-rendered GUI screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-gui-snapshots
+          path: tests/snapshots/**/*.png
+          if-no-files-found: warn
