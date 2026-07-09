@@ -19,6 +19,39 @@ a duplication, or a UX limitation. Priorities:
 Where a workaround exists today it is called out so you can see exactly what the
 UI is doing in the meantime.
 
+## Implementation status (updated 2026-07-09)
+
+**Everything in the P0/P1/P2 and S-1…S-8 sections below is now built** in the
+library — the "why / suggested API" text is kept for the record, but the
+workarounds it describes are gone. Concretely:
+
+- **P0-1 cancellation** — `nest_sparrow`/`nest_sheets` take `cancel:
+  Option<Arc<AtomicBool>>`; `CancelTerminator` (`src/optimize.rs`) stops mid-run
+  and returns a partial `NestResult`. `nest::nest` checks the flag too.
+- **P0-2 live events** — `NestEvent::{SheetCompleted, Progress}` callback
+  (`src/optimize.rs`) replaces the bare `usize`; sheets stream as finalized.
+- **P0-3 shared oversized logic** — `optimize::nest_sheets` owns the
+  nest-then-append-oversized pipeline; CLI and GUI both call it.
+- **P0-4 diagnostics** — `diag::{Diagnostic, Severity}`; the library returns them
+  instead of `eprintln!`.
+- **P1-5 piece metadata** — `Piece.{area, source: PieceSource, id}` all present.
+- **P1-6 / S-1 per-sheet stats** — `stats::{SheetStats, sheet_stats,
+  all_sheet_stats}` with yield, `cut_len_mm`, `pierces`, `est_run_secs`.
+- **P1-7 hull fallback** — `NestItem.hull_fallback: bool`.
+- **P1-8 Clone** — `Placed`, `NestItem`, `NestOutcome`, `SheetStats` all derive it.
+- **P2-9 pin-and-re-nest** — `optimize::nest_sheets_pinned` + `nest::nest_pinned`.
+- **P2-10 in-memory emit** — `emit::build_sheet_drawings`; `emit::emit` wraps it.
+- **S-2 spacing/margin/kerf-comp** — DONE (see its section).
+- **S-3 nest-into-holes** — DEFERRED, blocked upstream (see its section).
+- **S-4 mirror** — DONE, manual flip (see its section).
+- **S-5 placement ops** — `Placed::{move_to_sheet, flip_h, flip_v}`, `locked`.
+- **S-6 stable id** — `Piece.id` (content hash + occurrence counter).
+- **S-7 SVG export** — `svg::{write_svg, sheet_svgs, combined_svg}`.
+- **S-8 material** — `stats::{Material, CutProfile}`.
+
+**The only genuinely unbuilt work is the Roadmap (R0–R3) at the bottom** of this
+file, plus the two upstream-blocked nesting items (S-3, auto-mirror).
+
 ---
 
 ## P0-1. Cooperative cancellation for nesting
@@ -459,3 +492,278 @@ through the job so the stats/kerf features have a home.
 - **`NestItem.polygon` is already public**, so the UI can draw nesting outlines.
 - **The types are already `Send`**, so moving work to a background thread needs
   nothing from you.
+
+---
+
+# Roadmap: features beyond nesting (proposed 2026-07-09)
+
+A prioritized backlog of non-nesting features surfaced after the core app
+shipped. Owner tags: **[gui]** = egui-designer (`src/gui.rs`), **[lib]** =
+nesting-backend (library), **[both]**. Effort: **S** (hours) / **M** (a focused
+session) / **L** (multi-session).
+
+**Progress (2026-07-09):** the backend track is essentially complete. DONE:
+**R1-1a** (single `Cut` layer + colour), **R1-1b** (outer/inner cut-layer split),
+**R3-1** (part quantity), **R3-2** (engraved assembly numbers, lib core), **R3-3**
+(micro-tabs), **R3-4** (holes-before-outline cut order). All are surfaced through
+`emit::EmitOptions` + `emit::emit_opts` and per-piece `Piece.quantity`, with CLI
+flags for each. Remaining lib item: **R2-3** (arc/polyline offsetter — flagged a
+drop candidate). Everything else — **R0** quick wins, **R1-2** save/load, **R1-3**
+undo, **R2-1** canvas manipulation, **R2-2** units, and the GUI halves of **R3-2**
+(toggle + user-driven number) and the new emit knobs — is **[gui]**. See the
+**GUI wiring hand-off** at the end of this file. Each item's STATUS line has
+details.
+
+## R0 — Quick wins (wire existing stubs)
+
+These are `menu_todo` placeholders in `src/gui.rs` today; small, mostly [gui].
+
+- **R0-1 Zoom + keyboard nav** [gui] **S** — Zoom In/Out (⌘±), Fit Sheet (⌘0),
+  Actual Size (⌘1). The zoom HUD + scroll-zoom already drive `zoom`/`pan`; just
+  wire the menu items and keyboard shortcuts to that existing state. "Fit Sheet"
+  = compute zoom so the active sheet fills the canvas; "Actual Size" = 1 px/mm.
+- **R0-2 Export All Sheets (⇧⌘E)** [gui] **S** — `emit::emit` already writes
+  every sheet; the current Export is effectively all-sheets. Wire the menu item
+  and make "Export this sheet" the filtered case.
+- **R0-3 Select All / Deselect / Delete From Nest** [both] **M** *(was S–M —
+  nemesis)* — selection is a single `sel_id` today; add a multi-select set.
+  **Delete** must model removal as a `removed: HashSet<u64>` keyed on stable
+  `Piece.id`, applied only when building the nest input — **never** filter/shrink
+  the `pieces` vec: `Placed.piece_index`, `bboxes[]`, `labels[]`,
+  `NestItem.piece_index`, and `model.piece_rings[]` are all positional indices
+  into one `pieces` vec, so shrinking it misaligns every placement. Must also
+  survive `reextract()` (which rebuilds pieces + clears selection).
+- **R0-4 About / Keyboard Shortcuts dialogs** [gui] **S** — static modal content.
+
+> **Nemesis note (R0-1):** wiring real keyboard shortcuts surfaces an existing
+> **⌘R collision** — "Reload Source" and "Re-nest Current Sheet" share the chord.
+> Reassign one first. **(R0-2):** the "Export Active Sheet…" menu label is
+> currently a lie — it runs `emit::emit`, which writes ALL sheets; R0-2 must add
+> real per-sheet filtering, not just a rename.
+
+## R1 — High value
+
+- **R1-1a Single "Cut" layer + color** [lib] **S** — **STATUS (2026-07-09):
+  DONE.** `emit` now routes every emitted entity through `add_cut`, which stamps
+  `common.layer = "Cut"` and `common.color = ACI 1` (red); `register_cut_layer`
+  adds the `Cut` layer to each sheet's table with that colour, and copied block
+  definitions have their sub-entities re-layered too (so INSERT geometry cuts even
+  when the consumer doesn't inherit the INSERT's layer). Laser software
+  (LightBurn, etc.) imports the output as one cut op with no manual layer
+  assignment. Tested in `tests/quantity.rs` (layer + ACI on emitted geometry and
+  in the layer table). (No "engrave/score" layer: the loader drops all HATCH
+  fills, so every surviving entity is already a cut — an engrave layer would
+  always be empty. The real engrave need is R3-2, engraved part numbers.)
+- **R1-1b Outer-cut vs inner-cut layer split** [lib] **M** — **STATUS
+  (2026-07-09): DONE.** `EmitOptions.split_cut_layers` (CLI `--split-layers`) puts
+  each loose part's outer contour on `Cut-Outer` (ACI 1) and its holes on
+  `Cut-Inner` (ACI 3), so the two can carry different laser ops. Role is decided
+  by outline area — the largest ring/entity is the outer contour, the rest are
+  holes (`emit::cut_role`), applied on the faithful, kerf-comp, and tab paths.
+  **Block (INSERT) pieces are not split** — a block is one INSERT entity, so it
+  stays on `Cut` and a warning diagnostic reports how many did. Off by default
+  (single `Cut` layer, R1-1a). Tested in `tests/split_layers.rs`.
+- **R1-2 Save / Load a job + Recent files + drag-drop DXF** [both] **M–L** —
+  serialize a job: source DXF path **+ content hash**, params **including
+  `sources`/extraction settings** (the piece *set* depends on `params.sources`, so
+  reloading with a different `sources` orphans placements even on an unchanged
+  file), per-part placements, and locks. **Identity is the hard part:** `Placed`
+  stores `piece_index`, not `id`, so persist an explicit `piece_index → Piece.id`
+  map. `Piece.id` (quantized bbox+area hash + occurrence counter) is stable
+  **only across re-extraction of the same file** — any DXF edit that nudges a
+  piece's extent orphans its placements. So define explicit **reload-on-hash-
+  mismatch** behavior: re-extract, re-attach by id, warn, and drop unmatched
+  placements. Restore `sources`/params *before* re-extracting.
+- **R1-3 Undo / Redo** [gui] **M** — a command-history stack over the existing
+  unidirectional intent loop; snapshot the `Placed` set (it's `Clone`) or record
+  inverse ops. Land this **before/with** R2-1 so manual moves are reversible.
+
+## R2 — Deeper
+
+- **R2-1 Direct canvas manipulation** [gui] **M–L** — drag a part to reposition,
+  arrow-key nudge, snap. Hit-test via point-in-polygon on the rendered outline;
+  drag updates `Placed.transform`. Depends on **R1-3** (undo). Manual moves aren't
+  overlap-checked (documented caller responsibility — a re-nest cleans up).
+- **R2-2 Units (user-asserted mm/inch) + material catalog** [both] **M** — a units
+  *reinterpretation* toggle (input `$INSUNITS` is unset, so the tool assumes mm;
+  the toggle only relabels on the user's assertion — it can't make units "real")
+  plus a per-material catalog driving `CutProfile` (feed/pierce) and kerf. Est.
+  run stays a labelled **estimate** (feed rates are inherently approximate). This
+  is really the UI for **S-8** (`Material`) + **S-1** (`CutProfile`) — build on
+  that seam, don't duplicate it.
+- **R2-3 Arc/polyline kerf compensation (denser joins)** [lib] **L** *(renamed
+  from "faithful curve" — nemesis: unachievable)* — a NURBS offset is not a NURBS,
+  so a "faithful curve offset" can't exist; the best upgrade over the shipped
+  Option-A miter offset is a proper offsetter that emits clean arc/polyline joins.
+  **Hard acceptance criterion: pure-Rust offsetter only (e.g. `cavalier_contours`)
+  — NO new C dependency**, or it breaks the Windows static cross-compile guarantee
+  (Clipper2 is C++). Marginal gain for L effort — **candidate to drop** unless a
+  concrete dimensional-accuracy complaint appears.
+
+## R3 — Missing domain features (nemesis-surfaced; a laser user expects these)
+
+- **R3-1 Part quantity / copies** [lib] **M** — **STATUS (2026-07-09): DONE.**
+  `Piece.quantity` (default 1, raised by the GUI's per-part knob) drives
+  `nest::build_items`, which now reserves one nesting item per copy (sharing the
+  piece index). Placements, `emit`, and stats all resolve each copy back to the
+  same source piece, so N copies nest, cut, and count correctly. Implemented by
+  item expansion rather than jagua `demand` because the sheet-peeling loop rebuilds
+  its instance each round (demand wouldn't survive the peel), and expansion also
+  composes with the greedy `nest` fallback. Reachable from the CLI via `--copies N`
+  (uniform; nest packer). Tested in `tests/quantity.rs` (3 copies → 3 items → 3
+  placements → 3 emitted outlines). *Caveat:* combining `quantity > 1` with the
+  pinned re-nest path (`nest_pinned`) is not supported — its `piece_index → item`
+  map assumes one item per piece; unaffected while all quantities are 1.
+- **R3-2 Assembly numbering + engraved part labels** [both] **M** — **STATUS
+  (2026-07-09): lib core DONE.** `EmitOptions.engrave_numbers` (CLI `--engrave`)
+  adds a centred TEXT label of each piece's 1-based assembly number at its
+  footprint centre, on a registered `Engrave` layer (ACI 5, kept off the cut
+  layer so it runs as a separate op). Surfaced via `EmitReport.diagnostics`.
+  Tested in `tests/engrave_sequence.rs`. *Remaining [gui]:* a toggle, and
+  optionally a user-driven number instead of `piece_index + 1`.
+- **R3-3 Micro-tabs / holding bridges** [lib] **M** — **STATUS (2026-07-09):
+  DONE.** `EmitOptions.{tab_width, tab_count}` (CLI `--tab-width`/`--tab-count`)
+  breaks each outline ring into open polyline segments separated by `tab_count`
+  uncut gaps of `tab_width`, distributed evenly by arc length (`emit::tab_ring`),
+  so fully-cut parts stay attached. Like kerf-comp it's an opt-in
+  polyline-approximation mode (curved outlines flattened) with the tradeoff
+  surfaced as a diagnostic; degenerate/over-tabbed rings fall back to a whole
+  outline. Composes with kerf compensation (tabs the compensated rings). Tested
+  in `tests/micro_tabs.rs` (cut length = perimeter − tab_count·tab_width).
+- **R3-4 Cut sequencing (holes before outline)** [lib] **S** — **STATUS
+  (2026-07-09): DONE.** Within each piece, `emit` now orders cuts by ascending
+  outline area (`emit::entity_area`) so interior rings/holes cut before the outer
+  contour — applied to loose entities, copied block sub-entities, and the
+  kerf-comp/tab ring paths. Always on (no fidelity cost; pure reorder). Verified
+  in `tests/engrave_sequence.rs` (hole emitted before the outer square).
+
+## Still blocked (nesting — listed for completeness)
+
+- **Nest-into-holes** (S-3): blocked upstream by jagua-rs dropping polygon holes.
+- **Automatic mirror during nesting** (S-4): sparrow is rotation-only; jagua's bpp
+  demand model can't express "place the part OR its mirror, exactly once."
+
+## Nemesis review
+
+An adversarial red-team pass (2026-07-09) against the codebase. The premise held
+(R0–R2 are all genuinely unbuilt `menu_todo` stubs), but framing and hidden
+prerequisites needed fixing — folded into the items above. Key findings:
+
+- **Critical — R2-3 "faithful curve" is unachievable + risks the Windows build.**
+  A NURBS offset isn't a NURBS; and a Clipper2 offsetter is C++, which would break
+  the "no C dependency / static MinGW" Windows guarantee. → Renamed to arc/polyline
+  joins; pure-Rust-offsetter-only made a hard acceptance criterion; flagged as a
+  drop candidate.
+- **Major — R1-1 overstated.** No engrave geometry exists (HATCH fills are dropped
+  on load), INSERT/Block pieces can't be per-ring layered, and the claimed
+  outer/hole classification isn't present on the default emit path. → Split into
+  R1-1a (single Cut layer + color, correct & cheap — ship first) and R1-1b (outer/
+  inner split, loose parts only); engrave need repurposed as R3-2.
+- **Major — R1-2 / R0-3 identity.** `Piece.id` is stable only across re-extraction
+  of the *same* file, not across DXF edits or `sources` changes; `Placed` keys on
+  `piece_index` (positional), so deletion-by-filtering misaligns everything. →
+  Deletion modelled as a `removed`-by-`id` set (never shrink `pieces`); Save/Load
+  persists `sources`/params + an explicit index→id map with defined
+  reload-on-hash-mismatch behavior.
+- **Major — R2-2 units.** Input units are unknowable ($INSUNITS unset), so a toggle
+  can only *reinterpret* on the user's assertion; Est. run stays an estimate. →
+  Reframed; cross-referenced to S-8/S-1.
+- **Minor** — ⌘R shortcut collision (Reload Source vs Re-nest); the "Export Active
+  Sheet" label already writes all sheets; shipped manual ops already mutate without
+  undo (noted, not reordered).
+- **Missing (added as R3-1…R3-4):** part quantity (jagua `demand` hardcoded to 1),
+  engraved assembly numbers (the real engrave use case for a stacked model),
+  micro-tabs/holding bridges, and hole-before-outline cut sequencing.
+
+**Top 3 changes it insisted on (all applied):** (1) rewrite R2-3 to drop "faithful
+curve" and forbid a C dependency; (2) split R1-1 and delete the empty engrave
+layer, repurposing it as R3-2; (3) harden R1-2/R0-3 around stable-`id` identity
+rather than betting on more stability than `Piece.id` provides.
+
+---
+
+# GUI wiring hand-off (backend → egui-designer, 2026-07-09)
+
+The backend track is done. Six shipped features now need UI. This is what to wire;
+none of it is a blocker (the app still runs), each item just exposes a finished
+backend seam. All emit-time features flow through **one** new entry point.
+
+## 1. Switch export to `emit::emit_opts`
+
+The export path currently calls `emit::emit(&drawing, &pieces, &placed, &dir,
+stem, kerf)` (`src/gui.rs`, `Intent::Export`, ~line 721). `emit` still works (it's
+now a thin `f64`→kerf-comp wrapper), but the new knobs live on:
+
+```rust
+pub struct EmitOptions {
+    pub kerf_comp: f64,        // existing `kerf_mm` knob (already wired via `emit`)
+    pub engrave_numbers: bool, // R3-2
+    pub tab_width: f64,        // R3-3 (0 = off)
+    pub tab_count: usize,      // R3-3 (tabs per ring)
+    pub split_cut_layers: bool,// R1-1b
+}   // #[derive(Clone, Copy, Debug, Default)] — Default = faithful cut, nothing extra
+
+pub fn emit_opts(source, pieces, placed, out_dir, stem, opts: EmitOptions)
+    -> std::io::Result<EmitReport>;
+```
+
+Replace the `emit(...)` call with `emit_opts(..., EmitOptions { kerf_comp: kerf,
+..from the controls below })`. Keep surfacing `EmitReport.diagnostics` (you already
+do) — every new mode pushes a `Diagnostic` there (see §4).
+
+`build_sheet_drawings(source, pieces, placed, opts)` also now takes `EmitOptions`
+(was `f64`) if you use it for preview.
+
+## 2. New controls to add (map to `EmitOptions` / `Params`)
+
+| Control (Slate NEST bar / setup) | Field | Notes |
+|---|---|---|
+| **Engrave part numbers** toggle | `engrave_numbers` | TEXT of `piece_index+1` on the `Engrave` layer, centred on each part. |
+| **Micro-tabs**: width + count | `tab_width`, `tab_count` | `tab_width > 0 && tab_count > 0` ⇒ tabs on. **Forces polyline mode** (splines flattened) — same fidelity trade as kerf-comp; the diagnostic says so. |
+| **Split outer/inner cut layers** toggle | `split_cut_layers` | Loose parts only. Outer→`Cut-Outer` (red), holes→`Cut-Inner` (green). Blocks stay on `Cut` and emit a warning. |
+
+`Params` already has `kerf_mm` wired as `kerf_comp`. The three new toggles/knobs
+are net-new `Params` fields + widgets. `nest_into_holes`, `mirror_allowed`,
+`combine_single` remain as-is (combine is real for SVG; the other two stay
+disabled — still blocked upstream).
+
+**Emitted layers** are now `Cut` (+ `Cut-Outer`/`Cut-Inner` when split, `Engrave`
+when engraving). If the canvas legend or a layer chip reflects output layers, it
+can read these names.
+
+## 3. Per-piece quantity (R3-1)
+
+`Piece.quantity: usize` (default 1) is the copy count. Add a per-part **quantity
+stepper** to the piece list / context menu that sets `model.pieces[i].quantity`.
+`nest::build_items` reserves one nesting item per copy, so the **nest packer**
+places/cuts/counts N copies automatically — no other call changes.
+
+Caveats (same identity story as `locked`/selection):
+- **Reset to 1 on `reextract()`** — re-apply saved quantities by `Piece.id` after
+  re-extraction, exactly like you plan to for locks (R1-2).
+- The **rect packer ignores** quantity (bbox path); it's a nest-packer feature.
+- **`nest_sheets_pinned` + quantity > 1 is unsupported** (its `piece_index → item`
+  map assumes one item per piece). Fine while pinning is used with quantity 1.
+
+## 4. Diagnostics to render
+
+`EmitReport.diagnostics` now carries an `Info`/`Warning` line for each active
+mode: kerf-comp, engraving, micro-tabs (all `Info`, noting the polyline
+approximation), split-layers (`Info`), and a **`Warning`** counting block pieces
+that couldn't be split. Route them to the status/diagnostics area as you already
+do for the kerf-comp notice.
+
+## 5. Already automatic (no control needed)
+
+- **R3-4 cut sequencing** — holes are always emitted before the outer contour.
+- **R1-1a single `Cut` layer + colour** — always on when the split is off.
+
+## 6. Remaining GUI-only roadmap
+
+Unchanged and still yours: **R0-1..R0-4** (zoom/nav, export-all, multi-select +
+delete-by-`id`, about/shortcuts), **R1-2** (save/load + recent + drag-drop),
+**R1-3** (undo/redo), **R2-1** (canvas manipulation), **R2-2** (units + material
+catalog UI over `stats::Material`/`CutProfile`), and the GUI half of **R3-2** (the
+engrave toggle above, plus optionally a user-assigned number instead of
+`piece_index+1`). Watch the two nemesis notes: the **⌘R collision** (Reload Source
+vs Re-nest) and the **"Export Active Sheet" label** that actually writes all sheets.

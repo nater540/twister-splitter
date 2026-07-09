@@ -59,6 +59,32 @@ struct Cli {
   /// Higher = tighter packing, fewer sheets.
   #[arg(long, default_value_t = 12.0)]
   time: f64,
+
+  /// Nest this many copies of every piece (R3-1; nest packer only). 1 = one of
+  /// each. The GUI can set copies per-piece; this flag sets a uniform count.
+  #[arg(long, default_value_t = 1)]
+  copies: usize,
+
+  /// Engrave each piece's assembly number as TEXT on the `Engrave` layer (R3-2),
+  /// so a stacked/layered model can be re-stacked in order.
+  #[arg(long)]
+  engrave: bool,
+
+  /// Micro-tab (holding-bridge) length in DXF units (0 = off): leaves uncut gaps
+  /// so fully-cut parts stay attached to the sheet (R3-3). Emits outlines as open
+  /// polylines (curved outlines approximated). Use with `--tab-count`.
+  #[arg(long, default_value_t = 0.0)]
+  tab_width: f64,
+
+  /// Number of micro-tabs per outline ring (R3-3; used when `--tab-width` > 0).
+  #[arg(long, default_value_t = 4)]
+  tab_count: usize,
+
+  /// Split each loose part's outer contour onto a `Cut-Outer` layer and its holes
+  /// onto `Cut-Inner` (R1-1b), for separate laser operations. Loose parts only;
+  /// block pieces stay on `Cut`.
+  #[arg(long)]
+  split_layers: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -123,7 +149,14 @@ fn main() -> ExitCode {
     }
   };
 
-  let (pieces, diags) = extract::extract(&drawing, cli.sources.into());
+  let (mut pieces, diags) = extract::extract(&drawing, cli.sources.into());
+  // Apply a uniform copy count (R3-1). The nest packer's `build_items` reserves
+  // one item per copy; the rect packer ignores it.
+  if cli.copies != 1 {
+    for p in &mut pieces {
+      p.quantity = cli.copies;
+    }
+  }
   for d in &diags {
     let prefix = match d.severity {
       twister_splitter::diag::Severity::Warning => "warning",
@@ -165,7 +198,14 @@ fn main() -> ExitCode {
     .file_stem()
     .and_then(|s| s.to_str())
     .unwrap_or("out");
-  match emit::emit(&drawing, &pieces, &placed, &cli.out_dir, stem, cli.kerf_comp) {
+  let emit_opts = emit::EmitOptions {
+    kerf_comp: cli.kerf_comp,
+    engrave_numbers: cli.engrave,
+    tab_width: cli.tab_width,
+    tab_count: cli.tab_count,
+    split_cut_layers: cli.split_layers,
+  };
+  match emit::emit_opts(&drawing, &pieces, &placed, &cli.out_dir, stem, emit_opts) {
     Ok(report) => {
       for d in &report.diagnostics {
         println!("  note: {}", d.message);
@@ -244,8 +284,10 @@ fn pack_nest(drawing: &Drawing, pieces: &[Piece], cli: &Cli) -> (Vec<Placed>, Ve
   }
 
   // Surface hull-fallback pieces (non-simple outline nested by convex hull).
+  // With `--copies`, a piece yields several identical items, so warn once each.
+  let mut warned_hull = std::collections::HashSet::new();
   for it in &items {
-    if it.hull_fallback {
+    if it.hull_fallback && warned_hull.insert(it.piece_index) {
       eprintln!(
         "note: [{}] outline was non-simple; nested by its convex hull",
         pieces[it.piece_index].label

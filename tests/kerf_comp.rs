@@ -119,6 +119,7 @@ fn emit_kerf_comp_produces_grown_polyline_and_diagnostic() {
     area: 400.0,
     source: PieceSource::Part,
     id: 1,
+    quantity: 1,
   };
   let placed = Placed {
     piece_index: 0,

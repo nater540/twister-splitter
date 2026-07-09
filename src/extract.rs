@@ -55,6 +55,11 @@ pub struct Piece {
   /// (unlike `label`/index, which shift when the source filter changes). Two
   /// geometrically-identical pieces get distinct ids via an occurrence counter.
   pub id: u64,
+  /// How many copies of this piece to nest (R3-1). Extraction sets it to 1; a
+  /// caller (the GUI's per-part quantity knob) may raise it. `nest::build_items`
+  /// then reserves one nesting item per copy, so the from-scratch nesters place
+  /// and `emit` renders that many. Reset to 1 on re-extraction.
+  pub quantity: usize,
 }
 
 impl Piece {
@@ -269,6 +274,7 @@ pub fn extract(drawing: &Drawing, sources: Sources) -> (Vec<Piece>, Vec<Diagnost
         area,
         source: PieceSource::Block,
         id,
+        quantity: 1,
       });
     } else if is_outline(entity) {
       if sources == Sources::Block {
@@ -312,6 +318,7 @@ pub fn extract(drawing: &Drawing, sources: Sources) -> (Vec<Piece>, Vec<Diagnost
       area,
       source: PieceSource::Part,
       id,
+      quantity: 1,
     });
   }
   if dropped > 0 {

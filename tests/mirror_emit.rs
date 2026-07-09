@@ -17,7 +17,7 @@ fn bb(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Bbox {
 }
 
 fn piece(kind: PieceKind) -> Piece {
-  Piece { label: "t".into(), kind, bbox: bb(0.0, 0.0, 60.0, 60.0), area: 1.0, source: PieceSource::Part, id: 1 }
+  Piece { label: "t".into(), kind, bbox: bb(0.0, 0.0, 60.0, 60.0), area: 1.0, source: PieceSource::Part, id: 1, quantity: 1 }
 }
 
 /// Sample a DXF arc (CCW from `sd`° to `ed`°) into `n+1` points.

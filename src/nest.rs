@@ -66,7 +66,7 @@ pub fn build_items_with(drawing: &Drawing, pieces: &[Piece], kerf_comp: f64) -> 
   pieces
     .iter()
     .enumerate()
-    .map(|(i, piece)| {
+    .flat_map(|(i, piece)| {
       let mut rings = Vec::new();
       match &piece.kind {
         PieceKind::Loose(entities) => {
@@ -115,7 +115,11 @@ pub fn build_items_with(drawing: &Drawing, pieces: &[Piece], kerf_comp: f64) -> 
       // here it can be reported per-piece rather than as an aggregate count.
       let pts: Vec<Point> = polygon.iter().map(|&[x, y]| Point(x as f32, y as f32)).collect();
       let hull_fallback = SPolygon::new(pts).is_err();
-      NestItem { piece_index: i, polygon, hull_fallback }
+      // One nesting item per requested copy (R3-1). Every copy shares the piece
+      // index, so its placement, emitted geometry and stats all resolve back to
+      // the same source piece. `quantity == 0` is treated as 1 (never a no-op).
+      let item = NestItem { piece_index: i, polygon, hull_fallback };
+      std::iter::repeat_n(item, piece.quantity.max(1))
     })
     .collect()
 }
